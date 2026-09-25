@@ -8,6 +8,45 @@ names, flame graphs and continuous profiles in Pyroscope.
 Nothing is injected into the target: no RTS patch, no `-prof` build. The
 program runs the code it would run anyway; the profiler reads it.
 
+## What it looks like
+
+The test program (`tests/testprog`) in Grafana, through `hsp collect` and
+Pyroscope. Its smoke mode runs three regions on labelled green threads, one
+after another; with `--label-mode full` each label is a root:
+
+![CPU and allocation flame graphs of the test program's three regions](docs/images/dashboard.png)
+
+`rid:allocy` owns nearly all the allocation, `rid:chatty` spends its CPU in
+the `child` it calls, and `rid:deep` recurses 300 frames (the `(305)` is the
+collapsed recursion) before doing the same work. Each panel alone:
+[CPU](docs/images/cpu-flamegraph.png), [allocation](docs/images/alloc-flamegraph.png).
+
+Its `requests` mode serves 24 "requests", each on a thread labelled
+`rid:req-<n>` that forks a helper labelled `rid:req-<n>|fork:bg`. Each request
+is a root, so one request's CPU or allocation is one click away:
+
+![CPU per request: one root per rid:req-n and its fork](docs/images/requests-cpu.png)
+
+([allocation per request](docs/images/requests-alloc.png)). The smoke test checks
+that the bytes hsp attributes to each request match what the thread itself
+counted (`getAllocationCounter`).
+
+To reproduce these without root, replay the smoke test's captures into the
+second UI stack:
+
+```bash
+nix run .#stack-alt           # in another terminal: Grafana :3301, collector :4051
+mkdir -p ~/.local/share/hsp-stack-alt/maps
+cp tests/smoke/build/ghc984/testprog.hsm ~/.local/share/hsp-stack-alt/maps/hsp-testprog.hsm
+hsp agent --from-capture tests/smoke/build/ghc984/live/smoke/cap.bin \
+  --exe tests/smoke/build/ghc984/hsp-testprog --collector http://127.0.0.1:4051 \
+  --host demo --label-mode full
+```
+
+A replay's samples start one minute before the replay and keep their
+spacing, so the data is at "now minus a minute". Two replays started less
+than a capture's length apart overlap in time and show as one profile.
+
 ## Build
 
 ```bash
@@ -128,9 +167,10 @@ Operability: `--metrics-file` writes Prometheus text every interval (for
 node_exporter's textfile collector; the collector serves `GET /metrics`);
 `--max-batch-mb` flushes early at the cap (default 64), `--spool-max-mb`
 bounds the spool (default 256, oldest first), `-r` sizes the ring (default
-8 MiB); a rising ring-drop count is warned about. Without root,
+8 MiB); a rising ring-drop count is warned about. `--host NAME` sets the
+`host` label (default: the machine's hostname). Without root,
 `hsp agent --from-capture cap.bin --exe BIN --collector URL` replays a
-capture through the same path.
+capture through the same path, with its first sample at one minute ago.
 
 ## UI stack
 
@@ -202,7 +242,7 @@ interval, nearest-preceding-code extent, DWARF line rescue) are in
 make test                          # bpf/hswalk.h on synthetic stacks, no root
 tests/smoke/build.sh               # tests/testprog for GHC 9.8 and 9.10 (haskell-flake) + maps
 GHC928=/path/to/ghc-9.2.8 tests/smoke/build.sh ghc928   # 9.2 is no longer in nixpkgs: point at one
-sudo tests/smoke.sh [ghc984|ghc910|ghc928]              # live: labels, callers, 300-deep walks, alloc, cost
+sudo tests/smoke.sh [ghc984|ghc910|ghc928]              # live: labels, callers, 300-deep walks, alloc, per-request alloc, DWARF naming, cost
 ```
 
 ## Layout
