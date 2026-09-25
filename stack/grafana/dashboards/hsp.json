@@ -37,6 +37,32 @@
             "$__all"
           ]
         }
+      },
+      {
+        "name": "run",
+        "label": "run",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-pyroscope-datasource",
+          "uid": "hsp-pyroscope"
+        },
+        "query": {
+          "type": "label",
+          "label": "run"
+        },
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "description": "The run label an hsp push carried, if any (All shows every push in the window)"
       }
     ]
   },
@@ -59,7 +85,7 @@
           "refId": "A",
           "queryType": "profile",
           "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
-          "labelSelector": "{service_name=~\"$service\"}"
+          "labelSelector": "{service_name=~\"$service\", run=~\"$run\"}"
         }
       ]
     },
@@ -81,7 +107,7 @@
           "refId": "A",
           "queryType": "profile",
           "profileTypeId": "memory:alloc_space:bytes::",
-          "labelSelector": "{service_name=~\"$service\"}"
+          "labelSelector": "{service_name=~\"$service\", run=~\"$run\"}"
         }
       ]
     },
@@ -103,7 +129,7 @@
           "refId": "A",
           "queryType": "metrics",
           "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
-          "labelSelector": "{service_name=~\"$service\"}",
+          "labelSelector": "{service_name=~\"$service\", run=~\"$run\"}",
           "groupBy": [
             "host",
             "pid"
