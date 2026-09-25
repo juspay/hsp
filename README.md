@@ -1,4 +1,4 @@
-# hsp — sampling profiler for GHC programs
+# hsp — continuous profiler for GHC programs
 
 CPU and allocation per Haskell function, on real traffic, sampled from outside
 the process with eBPF. The kernel side walks the GHC stack (the STG stack
