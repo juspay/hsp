@@ -1,4 +1,4 @@
-# hsp (haskell sampling profiler) — Low overhead runtime profiling for GHC programs
+# hsp (haskell sampling profiler) - Low-overhead, out-of-process continuous profiling for GHC programs using eBPF.
 
 CPU and allocation per Haskell function, on real traffic, sampled from outside
 the process with eBPF. The kernel side walks the GHC stack (the STG stack
