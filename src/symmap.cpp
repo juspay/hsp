@@ -489,8 +489,11 @@ hsmw::Lines dwarf_lines(const std::string& path) {
       for (size_t i = 0; i < n; i++) {
         Dwarf_Line* l = dwarf_onesrcline(lines, i);
         bool end; Dwarf_Addr a; int ln;
-        if (dwarf_lineendsequence(l, &end) || end) continue;
+        if (dwarf_lineendsequence(l, &end)) continue;
         if (dwarf_lineaddr(l, &a) || dwarf_lineno(l, &ln)) continue;
+        // a sequence's end is a row too (line 0): the addresses after it have
+        // no line until the next sequence starts, however close that is
+        if (end) ln = 0;
         const char* src = dwarf_linesrc(l, nullptr, nullptr);
         std::string f = src ? src : "";
         auto slash = f.rfind('/');
@@ -504,7 +507,10 @@ hsmw::Lines dwarf_lines(const std::string& path) {
   }
   dwarf_end(dw);
   close(fd);
-  std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return std::tie(a.addr, a.fid, a.line) < std::tie(b.addr, b.fid, b.line); });
+  // at one address an end row sorts first, so a sequence starting there wins
+  std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) {
+    return std::make_tuple(a.addr, a.line != 0, a.fid, a.line) < std::make_tuple(b.addr, b.line != 0, b.fid, b.line);
+  });
   for (auto& r : rows) { L.addr.push_back(r.addr); L.file.push_back(files[r.fid]); L.line.push_back(r.line); }
   return L;
 }

@@ -101,6 +101,12 @@ check $(( nseen == nreq && nreq > 0 ? 0 : 1 )) "requests: $nseen/$nreq have allo
 check $(python3 -c "print(0 if $r >= 0.95 else 1)") "per-request allocation, hsp vs the thread's own counter: r = $r (expected >= 0.95)"
 check $(python3 -c "print(0 if 0.7 <= $ratio <= 1.3 else 1)") "per-request allocation total, hsp / counter = $ratio (expected 0.7-1.3)"
 check $frc "fold exit $frc (resolution gate)"
+# the collector names leaves with DWARF lines on: requests never run the smoke
+# regions, so none of them may appear (a line row leaking past its sequence's
+# end once named work's loop after deep)
+"$HSP" fold "$O/cap.bin" "$S/testprog.hsm" "$O/lines" > "$O/agg-lines.txt"; lrc=$?
+w=$(grep -cE 'Main\.(allocy|chatty|deep)\b' "$O/lines/collapsed.txt")
+check $(( lrc == 0 && w == 0 ? 0 : 1 )) "DWARF-line naming: $w stacks name a function requests never run (expected 0)"
 
 fi
 [ $fail = 0 ] && echo "SMOKE OK ($V)" || { echo "SMOKE FAILED ($V: $OUT)"; exit 1; }

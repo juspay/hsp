@@ -114,7 +114,7 @@ Hit Map::resolve_extent(uint64_t addr) const {
 
 std::optional<std::pair<uint32_t, uint32_t>> Map::line_at(uint64_t pc) const {
   long k = last_le(ln_addr_, h_->n_lines, pc);
-  if (k < 0 || pc - ln_addr_[k] > 4096) return std::nullopt;
+  if (k < 0 || !ln_line_[k] || pc - ln_addr_[k] > 4096) return std::nullopt;   // line 0: past a sequence's end
   return std::make_pair(ln_file_[k], ln_line_[k]);
 }
 

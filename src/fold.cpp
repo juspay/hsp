@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <set>
@@ -166,6 +167,9 @@ int cmd_fold(int argc, char** argv) {
   const char* path = argv[0];
   std::string outdir = argv[2];
   auto join_path = [&](const char* fn) { return outdir.ends_with("/") ? outdir + fn : outdir + "/" + fn; };
+  std::error_code ec;
+  std::filesystem::create_directories(outdir, ec);
+  if (ec) { std::fprintf(stderr, "hsp fold: cannot create %s: %s\n", outdir.c_str(), ec.message().c_str()); return 2; }
   double max_unresolved = 1.0;
   bool lines = true;
   for (int i = 3; i < argc; i++) {

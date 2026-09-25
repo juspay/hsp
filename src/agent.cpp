@@ -76,6 +76,7 @@ struct Batch {
 
 struct Agent {
   std::string service, collector, spool, label_mode = "full";
+  std::string host;          // reported host name; empty = gethostname()
   unsigned freq = 99;
   int64_t mono_to_real = 0;      // CLOCK_REALTIME - CLOCK_MONOTONIC, ns
   Batch batch;
@@ -152,7 +153,8 @@ struct Agent {
     h.from_ns = batch.from_ns; h.until_ns = batch.until_ns ? batch.until_ns : batch.from_ns;
     h.freq_hz = freq; h.pid = pid; h.exe_size = exe_size;
     h.n_labels = batch.labels.size(); h.n_stacks = batch.stacks.size(); h.n_samples = batch.samples;
-    gethostname(h.host, sizeof h.host - 1);
+    if (host.empty()) gethostname(h.host, sizeof h.host - 1);
+    else std::snprintf(h.host, sizeof h.host, "%s", host.c_str());
     std::snprintf(h.service, sizeof h.service, "%s", service.c_str());
     std::snprintf(h.exe, sizeof h.exe, "%s", exe.c_str());
     o.append(reinterpret_cast<const char*>(&h), sizeof h);
@@ -329,7 +331,7 @@ pid_t find_by_comm(const std::string& comm) {
 
 void usage() {
   std::fputs("usage: hsp agent (-p PID | --name COMM | --from-capture FILE --exe PATH) --collector URL\n"
-             "                 [--service NAME] [--interval SECS] [--spool DIR] [--label-mode none|full|tag]\n"
+             "                 [--service NAME] [--host NAME] [--interval SECS] [--spool DIR] [--label-mode none|full|tag]\n"
              "                 [--metrics-file PATH] [--max-batch-mb MB] [--spool-max-mb MB]\n"
              "                 [-F hz] [-d depth] [-r ring_mb] [--no-label] [--no-alloc] [--no-thunk]\n", stderr);
 }
@@ -351,6 +353,7 @@ int cmd_agent(int argc, char** argv) {
     else if (f == "--exe") a.exe = val();
     else if (f == "--collector") a.collector = val();
     else if (f == "--service") a.service = val();
+    else if (f == "--host") a.host = val();
     else if (f == "--interval") interval = atof(val());
     else if (f == "--spool") a.spool = val();
     else if (f == "--label-mode") a.label_mode = val();
