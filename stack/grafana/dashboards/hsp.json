@@ -6,9 +6,9 @@
   ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "refresh": "30s",
+  "refresh": "10s",
   "time": {
-    "from": "now-6h",
+    "from": "now-30m",
     "to": "now"
   },
   "templating": {
