@@ -1,0 +1,26 @@
+# hsp collector: receives agents' batches, resolves them with the maps in
+# /var/lib/hsp/maps, pushes to Pyroscope.  One per fleet.  No capabilities.
+[Unit]
+Description=hsp collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hsp
+Group=hsp
+EnvironmentFile=-/etc/hsp/collect.env
+# HSP_LISTEN (e.g. 0.0.0.0:4041), HSP_PYROSCOPE (e.g. http://pyroscope:4040)
+ExecStart=/usr/local/bin/hsp collect --listen ${HSP_LISTEN} --maps /var/lib/hsp/maps --pyroscope ${HSP_PYROSCOPE}
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/var/lib/hsp/maps
+# the maps are mmap'd: the collector's RSS is the touched part of them
+MemoryMax=8G
+
+[Install]
+WantedBy=multi-user.target

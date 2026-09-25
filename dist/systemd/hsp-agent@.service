@@ -1,0 +1,42 @@
+# hsp agent for one GHC service: `systemctl enable --now hsp-agent@my-service`
+# The instance name is the process's comm (what /proc/PID/comm says).
+# Runs as an unprivileged user with exactly the capabilities BPF sampling
+# needs; no root shell, no writable filesystem beyond its spool.
+[Unit]
+Description=hsp continuous profiler for %i
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=hsp
+Group=hsp
+EnvironmentFile=-/etc/hsp/agent.env
+# HSP_COLLECTOR, HSP_INTERVAL, HSP_HZ, HSP_LABEL_MODE from agent.env
+ExecStart=/usr/local/bin/hsp agent --name %i \
+    --collector ${HSP_COLLECTOR} --interval ${HSP_INTERVAL} -F ${HSP_HZ} \
+    --label-mode ${HSP_LABEL_MODE} --spool /var/spool/hsp/%i \
+    --metrics-file /var/lib/node_exporter/textfile/hsp-agent-%i.prom
+# the agent exits when the target does; systemd restarts it when the service is back
+Restart=always
+RestartSec=5
+
+# CAP_BPF: load the program and its maps.  CAP_PERFMON: perf_event_open on
+# every CPU and attaching a perf_event BPF program.  CAP_SYS_PTRACE: read
+# /proc/PID/maps and /proc/PID/exe of another user's process.
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/spool/hsp /var/lib/node_exporter/textfile
+StateDirectory=hsp
+LogsDirectory=hsp
+MemoryMax=256M
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

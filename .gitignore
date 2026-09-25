@@ -1,0 +1,20 @@
+# build products
+build/
+result
+result-*
+*.o
+# generated maps and captures (GBs; never source)
+*.hsm
+*.bin
+*.eventlog
+# logs dumped while debugging (verifier output, run logs)
+*.log
+# test programs' outputs
+tests/smoke/smoke
+tests/smoke/build*/
+tests/testprog/dist-newstyle/
+tests/testprog/result*
+# editors / direnv
+.direnv/
+.envrc.local
+*.swp

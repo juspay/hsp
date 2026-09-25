@@ -1,0 +1,24 @@
+{
+  "uid": "hsp-overview",
+  "title": "hsp: Haskell CPU and allocation",
+  "tags": ["hsp"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": { "list": [
+    { "name": "service", "label": "service", "type": "query", "datasource": { "type": "grafana-pyroscope-datasource", "uid": "hsp-pyroscope" },
+      "query": { "type": "label", "label": "service_name" }, "refresh": 2, "includeAll": false }
+  ] },
+  "panels": [
+    { "type": "flamegraph", "title": "CPU: $service (samples)", "gridPos": { "x": 0, "y": 0, "w": 24, "h": 14 },
+      "datasource": { "type": "grafana-pyroscope-datasource", "uid": "hsp-pyroscope" },
+      "targets": [ { "refId": "A", "queryType": "profile", "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds", "labelSelector": "{service_name=\"$service\"}" } ] },
+    { "type": "flamegraph", "title": "Allocation: $service (bytes)", "gridPos": { "x": 0, "y": 14, "w": 24, "h": 14 },
+      "datasource": { "type": "grafana-pyroscope-datasource", "uid": "hsp-pyroscope" },
+      "targets": [ { "refId": "A", "queryType": "profile", "profileTypeId": "memory:alloc_space:bytes::", "labelSelector": "{service_name=\"$service\"}" } ] },
+    { "type": "timeseries", "title": "CPU samples/s: $service (per host, pid)", "gridPos": { "x": 0, "y": 28, "w": 24, "h": 8 },
+      "datasource": { "type": "grafana-pyroscope-datasource", "uid": "hsp-pyroscope" },
+      "targets": [ { "refId": "A", "queryType": "metrics", "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds", "labelSelector": "{service_name=\"$service\"}", "groupBy": ["host", "pid"] } ] }
+  ]
+}
