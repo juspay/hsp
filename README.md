@@ -215,9 +215,15 @@ Tiers, joined by address: the symbol table (what `nm --defined-only -S`
 lists, Z-decoded by `src/zdecode.h` into package/module/name); IPE
 (`-finfo-table-map`), read from the ELF (9.2's `InfoProvEnt` symbols, 9.8's
 static nodes) or from an eventlog; DWARF `.debug_line` rows through libdw.
-Then the roll-up of every entry to its top-level binding (source-span
-containment, `$w`/`$s` worker names, address adjacency between resolved
-neighbours of the same module), a refinement pass (entries whose source file
+Then the roll-up of every entry to its top-level binding, in order of
+trust: source-span containment (IPE); the enclosing DWARF subprogram's
+source name (`-g`: GHC names each procedure after the binding it came
+from, `object`, `untracedPaths.raw`), accepted only when that name is a
+binding the module actually defines, since an inlined origin's name is not;
+`$w`/`$s` worker names, on real names only; and the resolved neighbour of
+the same module closest by address, before or after (measured against the
+764k entries DWARF settles on a production service: closest is right 76%,
+the one before 75%, the one after 66%). Then a refinement pass (entries whose source file
 belongs to another module are inlined code and are named by the enclosing
 binding of their own module; anchors rebuilt from exact entries only;
 packages filled from module -> package) and the `.hsm` writer. `hsp dump MAP`

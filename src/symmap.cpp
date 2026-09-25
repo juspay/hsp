@@ -13,6 +13,7 @@
 //   DWARF   .debug_line rows (libdw), for resolve_leaf.
 // The .mix tier (flow-trace builds) is not ported: it needs hpc sidecars.
 #include <elf.h>
+#include <dwarf.h>
 #include <elfutils/libdw.h>
 #include <libelf.h>
 #include <fcntl.h>
@@ -468,6 +469,69 @@ std::string worker_parent(const std::string& name) {
 
 // ---------------------------------------------------------------- DWARF
 
+// DW_TAG_subprogram entries: with -g GHC emits one per procedure, named
+// after the *source* binding it was compiled from ("object", "untracedPaths.raw"
+// for a local `raw' inside untracedPaths), plus an "L<digits>" placeholder for
+// bindings the compiler made up.  For an info table with no source span this
+// is the only thing that says which binding the code belongs to.
+struct Subprogram { uint64_t lo, hi; std::string name; };
+
+bool placeholder_name(const std::string& n) {
+  if (n.size() < 2 || n[0] != 'L') return false;
+  for (size_t i = 1; i < n.size(); i++) if (!isdigit((unsigned char)n[i])) return false;
+  return true;
+}
+
+std::vector<Subprogram> dwarf_subprograms(const std::string& path) {
+  std::vector<Subprogram> out;
+  int fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0) return out;
+  elf_version(EV_CURRENT);
+  Dwarf* dw = dwarf_begin(fd, DWARF_C_READ);
+  if (!dw) { close(fd); return out; }
+  Dwarf_Off off = 0, next; size_t hsize;
+  while (dwarf_nextcu(dw, off, &next, &hsize, nullptr, nullptr, nullptr) == 0) {
+    Dwarf_Die cu;
+    if (dwarf_offdie(dw, off + hsize, &cu)) {
+      Dwarf_Die child;
+      if (dwarf_child(&cu, &child) == 0) {
+        do {
+          if (dwarf_tag(&child) != DW_TAG_subprogram) continue;
+          Dwarf_Addr lo = 0, hi = 0;
+          if (dwarf_lowpc(&child, &lo) || dwarf_highpc(&child, &hi) || hi <= lo) continue;
+          const char* nm = dwarf_diename(&child);
+          if (!nm || !*nm || placeholder_name(nm)) continue;
+          out.push_back({lo, hi, nm});
+        } while (dwarf_siblingof(&child, &child) == 0);
+      }
+    }
+    off = next;
+  }
+  dwarf_end(dw);
+  close(fd);
+  std::sort(out.begin(), out.end(), [](auto& a, auto& b) { return a.lo < b.lo; });
+  return out;
+}
+
+// the innermost-starting subprogram containing addr, or nullptr
+const Subprogram* subprogram_at(const std::vector<Subprogram>& S, uint64_t addr) {
+  auto it = std::upper_bound(S.begin(), S.end(), addr, [](uint64_t a, const Subprogram& s) { return a < s.lo; });
+  if (it == S.begin()) return nullptr;
+  --it;
+  return addr < it->hi ? &*it : nullptr;
+}
+
+// "untracedPaths.raw" is the local `raw' of untracedPaths: the top-level
+// binding is the part before the first '.' that separates two identifier
+// characters (so an operator like `.|.' is left whole)
+std::string dwarf_toplevel(const std::string& n) {
+  for (size_t i = 1; i + 1 < n.size(); i++)
+    if (n[i] == '.' && (isalnum((unsigned char)n[i - 1]) || n[i - 1] == '_' || n[i - 1] == '\'') &&
+        (isalnum((unsigned char)n[i + 1]) || n[i + 1] == '_' || n[i + 1] == '$'))
+      return n.substr(0, i);
+  return n;
+}
+
 hsmw::Lines dwarf_lines(const std::string& path) {
   hsmw::Lines L;
   int fd = open(path.c_str(), O_RDONLY);
@@ -532,6 +596,8 @@ int cmd_symmap(int argc, char** argv) {
   }
   ElfFile E(bin);
   std::vector<Sym> syms = read_symbols(E);
+  std::vector<Subprogram> subs = dwarf ? dwarf_subprograms(bin) : std::vector<Subprogram>{};
+  std::fprintf(stderr, "DWARF subprograms %zu (named; L<n> placeholders skipped)\n", subs.size());
   hsmw::Input in;
   in.exec_ranges = exec_ranges(E);
   std::fprintf(stderr, "symbols %zu, executable ranges %zu\n", syms.size(), in.exec_ranges.size());
@@ -598,7 +664,33 @@ int cmd_symmap(int argc, char** argv) {
   for (auto& [f, items] : per_file) { auto [it, _] = span_index.emplace(f, items); toplevels += it->second.spans.size(); }
   std::fprintf(stderr, "IPE spans: %zu files, %zu top-level bindings\n", span_index.size(), toplevels);
 
-  struct Pending { const Ipe* p; uint64_t info_ptr; std::optional<Span> span; int sym; std::string name, toplevel, how; };
+  // What a module actually defines, for judging a DWARF scope name: its IPE
+  // labels, its symbols' decoded names with $w/$s stripped, and instance
+  // methods by their bare name ($fShowFoo_$cshow defines `show').
+  std::unordered_map<std::string, std::unordered_set<std::string>> module_bindings;
+  auto add_binding = [&](const std::string& mod, const std::string& n) {
+    if (mod.empty() || n.empty()) return;
+    auto& set = module_bindings[mod];
+    set.insert(n);
+    std::string w = worker_parent(n); if (!w.empty()) set.insert(w);
+    auto c = n.rfind("_$c"); if (c != std::string::npos) set.insert(n.substr(c + 3));
+  };
+  for (auto& e : entries) if (e.source_tier == "symtab") add_binding(e.module, e.name);
+  // an IPE label counts only when its source file is the module's own (an
+  // inlined entry carries the origin's label: `packChars' inside HashSlot)
+  auto own_file = [](const std::string& mod, const std::string& file) {
+    auto slash = file.rfind('/'); std::string base = slash == std::string::npos ? file : file.substr(slash + 1);
+    auto dot = base.rfind('.'); if (dot != std::string::npos) base = base.substr(0, dot);
+    auto md = mod.rfind('.'); std::string last = md == std::string::npos ? mod : mod.substr(md + 1);
+    return base == last;
+  };
+  for (auto& p : ipes) if (!p.label.empty() && own_file(p.module, p.src_file)) add_binding(p.module, p.label);
+  auto dwarf_ok = [&](const std::string& mod, const std::string& top) {
+    auto it = module_bindings.find(mod);
+    return it != module_bindings.end() && it->second.count(top);
+  };
+
+  struct Pending { const Ipe* p; uint64_t info_ptr; std::optional<Span> span; int sym; std::string name, toplevel, how, inlined; };
   std::vector<Pending> pending; pending.reserve(ipes.size());
   for (auto& p : ipes) {
     Pending q; q.p = &p; q.info_ptr = p.info + delta; q.span = parse_span(p.src_span);
@@ -612,8 +704,18 @@ int cmd_symmap(int argc, char** argv) {
       }
     }
     if (q.toplevel.empty()) {
-      std::string cand = worker_parent(q.sym >= 0 ? entries[q.sym].name : q.name);
-      if (!cand.empty()) { q.toplevel = cand; q.how = "worker-name"; }
+      if (const Subprogram* sp = subprogram_at(subs, q.info_ptr)) {
+        std::string top = dwarf_toplevel(sp->name);
+        if (dwarf_ok(p.module, top)) { q.toplevel = top; q.how = "dwarf-scope"; }
+        else q.inlined = sp->name;             // an origin inlined here: named by the enclosing binding, below
+      }
+    }
+    if (q.toplevel.empty()) {
+      // $wfoo is foo's worker: on a real name (a label, or a decoded symbol),
+      // never on a bare table name like $wgo_sbY7_info
+      std::string base = q.sym >= 0 ? entries[q.sym].name : p.label;
+      std::string cand = worker_parent(base);
+      if (!cand.empty() && !cand.ends_with("_info")) { q.toplevel = cand; q.how = "worker-name"; }
     }
     pending.push_back(std::move(q));
   }
@@ -622,13 +724,41 @@ int cmd_symmap(int argc, char** argv) {
   for (auto& q : pending) if (!q.toplevel.empty()) anchors[q.p->module].push_back({q.info_ptr, q.toplevel});
   std::unordered_map<std::string, std::vector<uint64_t>> anchor_addrs;
   for (auto& [m, v] : anchors) { std::sort(v.begin(), v.end()); auto& a = anchor_addrs[m]; for (auto& [x, _] : v) a.push_back(x); }
-  auto anchor_before = [&](const std::string& mod, uint64_t a) -> const std::string* {
+  // The resolved binding of the same module closest by address, before or
+  // after.  Measured against the 764k entries DWARF settles on a production
+  // service: closest is right 76.3%, the one before 74.7% (GHC emits a
+  // binding's floated helpers just ahead of it, so "before" misses those),
+  // the one after 65.9%.
+  auto anchor_near = [&](const std::string& mod, uint64_t a) -> const std::string* {
     auto it = anchor_addrs.find(mod);
     if (it == anchor_addrs.end() || it->second.empty()) return nullptr;
-    auto k = std::upper_bound(it->second.begin(), it->second.end(), a);
-    if (k == it->second.begin()) return nullptr;
-    return &anchors[mod][k - it->second.begin() - 1].second;
+    auto& ad = it->second;
+    size_t k = std::upper_bound(ad.begin(), ad.end(), a) - ad.begin();   // first anchor after a
+    if (k == 0) return &anchors[mod][0].second;
+    if (k == ad.size()) return &anchors[mod][k - 1].second;
+    return &anchors[mod][(a - ad[k - 1] <= ad[k] - a) ? k - 1 : k].second;
   };
+  auto anchor_before = anchor_near;
+  // Which adjacency guess is right more often, measured against the entries
+  // DWARF settled: the nearest resolved binding before, or after, by address.
+  {
+    long prev_ok = 0, next_ok = 0, both = 0, neither = 0, n = 0, closer_ok = 0;
+    for (auto& q : pending) {
+      if (q.how != "dwarf-scope") continue;
+      auto it = anchor_addrs.find(q.p->module);
+      if (it == anchor_addrs.end()) continue;
+      auto& ad = it->second; auto& an = anchors[q.p->module];
+      auto k = std::upper_bound(ad.begin(), ad.end(), q.info_ptr) - ad.begin();   // first anchor after
+      std::string prev, next; uint64_t dprev = ~0ull, dnext = ~0ull;
+      for (long i = long(k) - 1; i >= 0; i--) if (an[i].second != q.toplevel || ad[i] != q.info_ptr) { prev = an[i].second; dprev = q.info_ptr - ad[i]; break; }
+      for (size_t i = k; i < ad.size(); i++) if (an[i].second != q.toplevel || ad[i] != q.info_ptr) { next = an[i].second; dnext = ad[i] - q.info_ptr; break; }
+      n++;
+      bool a = prev == q.toplevel, b = next == q.toplevel;
+      if (a && b) both++; else if (a) prev_ok++; else if (b) next_ok++; else neither++;
+      if ((dprev <= dnext ? a : b)) closer_ok++;
+    }
+    std::fprintf(stderr, "adjacency vs DWARF truth over %ld entries: prev-only right %ld, next-only right %ld, both %ld, neither %ld; closest-by-address right %ld\n", n, prev_ok, next_ok, both, neither, closer_ok);
+  }
   std::map<std::string, long> rollup_counts;
   for (auto& q : pending) {
     const Ipe& p = *q.p;
@@ -646,6 +776,7 @@ int cmd_symmap(int argc, char** argv) {
     e.source_tier = "ipe";
     e.bucket = bucket_for(e.package_name, e.symbol, user);
     e.rollup = q.how;
+    if (!q.inlined.empty() && q.how == "addr-adjacency") { e.inlined = "<dwarf>." + q.inlined; e.rollup = "inlined-site"; }
     e.closure_type_name = closure_type_name(p.closure_desc);
     uint32_t i = entries.size();
     entries.push_back(std::move(e));
@@ -660,13 +791,17 @@ int cmd_symmap(int argc, char** argv) {
     if (e.source_tier != "symtab" || !e.toplevel.empty() || e.module.empty()) continue;
     std::string parent = worker_parent(e.name);
     if (!parent.empty()) { e.toplevel = parent; e.rollup = "worker-name"; sym_rollup["worker-name"]++; continue; }
+    if (const Subprogram* sp = subprogram_at(subs, e.addr)) {
+      std::string top = dwarf_toplevel(sp->name);
+      if (dwarf_ok(e.module, top)) { e.toplevel = top; e.rollup = "dwarf-scope"; sym_rollup["dwarf-scope"]++; continue; }
+    }
     const std::string* t = anchor_before(e.module, e.addr);
     if (t && *t != e.name) { e.toplevel = *t; e.rollup = "addr-adjacency"; sym_rollup["addr-adjacency"]++; }
     else { e.toplevel = e.name; sym_rollup["self"]++; }
   }
 
   // -- refine(): inlined origins, clean anchors, packages
-  auto exact = [](const std::string& r) { return r == "mix-span" || r == "ipe-span" || r == "worker-name" || r == "self"; };
+  auto exact = [](const std::string& r) { return r == "mix-span" || r == "ipe-span" || r == "worker-name" || r == "self" || r == "dwarf-scope"; };
   {
     std::unordered_map<std::string, std::map<std::string, long>> static_files;
     for (auto& e : entries)
@@ -713,7 +848,11 @@ int cmd_symmap(int argc, char** argv) {
       bool has = ci != anc.end() && !ci->second.empty();
       if (!has && how == "addr-adjacency") continue;
       long k = -1;
-      if (has) { auto& ad = addrs[e.module]; k = long(std::upper_bound(ad.begin(), ad.end(), a) - ad.begin()) - 1; }
+      if (has) {   // closest by address, before or after (see anchor_near)
+        auto& ad = addrs[e.module];
+        size_t j = std::upper_bound(ad.begin(), ad.end(), a) - ad.begin();
+        k = j == 0 ? 0 : j == ad.size() ? long(j) - 1 : ((a - ad[j - 1] <= ad[j] - a) ? long(j) - 1 : long(j));
+      }
       if (k >= 0) { e.toplevel = ci->second[k].second; re_rolled[how]++; }
       else if (how == "inlined-site") { e.toplevel = "<inlined " + e.inlined + ">"; re_rolled["inlined-no-site"]++; }
       else if (e.source_tier == "symtab") { e.toplevel = e.name; e.rollup = "self"; re_rolled["adjacency->self"]++; }
