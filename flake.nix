@@ -52,6 +52,34 @@
         # a second instance on other ports (a test beside a running stack)
         stack-alt = stackApp "hsp-stack-alt" { grafanaPort = 3301; pyroscopePort = 4050; collectPort = 4051; };
       };
+      # NixOS: services.hsp.collect on the collector host, services.hsp.agents.<comm>
+      # on every service host (nix/module.nix); the package defaults to this flake's.
+      nixosModules.default = { ... }: {
+        imports = [ ./nix/module.nix ];
+        services.hsp.package = nixpkgs.lib.mkDefault hsp;
+      };
+      # an example host with both, evaluated by `nix flake check`
+      nixosConfigurations.example = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.default
+          ({ modulesPath, ... }: {
+            imports = [ "${modulesPath}/profiles/minimal.nix" ];
+            boot.loader.grub.enable = false;
+            fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
+            system.stateVersion = "25.11";
+            services.hsp.collect = { enable = true; pyroscope = "http://pyroscope.internal:4040"; openFirewall = true; };
+            services.hsp.agents.euler-api-txns = { collector = "http://127.0.0.1:4041"; };
+            services.hsp.agents.euler-webservice = { collector = "http://127.0.0.1:4041"; hz = 19; labelMode = "full"; extraArgs = [ "-d" "256" ]; };
+          })
+        ];
+      };
+      checks.${system} = let ex = self.nixosConfigurations.example.config.systemd; in {
+        package = hsp;
+        # the units the module generates, as files: evaluation is the test, no system build
+        nixos-module = pkgs.writeTextDir "units" (nixpkgs.lib.concatStringsSep "\n\n" (map (u: "== ${u}\n" + ex.units."${u}".text)
+          [ "hsp-collect.service" "hsp-agent-euler-api-txns.service" "hsp-agent-euler-webservice.service" ]));
+      };
       devShells.${system}.default = pkgs.mkShell {
         nativeBuildInputs = tools ++ [ pkgs.gcc ];
         buildInputs = deps;

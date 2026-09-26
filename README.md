@@ -156,7 +156,9 @@ the same across these versions.
 ## Continuous profiling
 
 The agent runs on the host, as root or with `CAP_BPF CAP_PERFMON
-CAP_SYS_PTRACE` (`dist/INSTALL.md`, `dist/systemd/`). Every interval it folds
+CAP_SYS_PTRACE` (`dist/INSTALL.md`, `dist/systemd/`; on NixOS the flake's
+`nixosModules.default` gives `services.hsp.collect` and
+`services.hsp.agents.<comm>`). Every interval it folds
 the samples since the last one into distinct stacks of raw info pointers with
 a count and the bytes the green threads allocated, and POSTs them to the
 collector (`src/wire.h`). The host holds no map and resolves nothing. The
@@ -280,6 +282,7 @@ sudo tests/smoke.sh [ghc984|ghc910|ghc928]              # live: labels, callers,
 | `src/capture.*`, `src/wire.h` | file formats: captures, agent -> collector batches |
 | `stack/`, `dist/` | the UI stack module; systemd units, capabilities, install notes |
 | `tests/` | the walker test, the test program, the live smoke test |
+| `nix/module.nix` | the NixOS module: collector and agents as systemd units |
 
 ## Next
 

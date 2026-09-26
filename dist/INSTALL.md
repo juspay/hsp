@@ -22,7 +22,30 @@ fine with `CAP_PERFMON`; `kernel.unprivileged_bpf_disabled=1` is fine with
 
 The collector needs no capabilities.
 
-## systemd
+## NixOS
+The flake has a module that produces the units below with the same user, capabilities, hardening, spool and metrics
+paths, so a host needs only its configuration:
+
+```nix
+{
+  inputs.hsp.url = "github:juspay/hsp";
+  # ...
+  imports = [ hsp.nixosModules.default ];
+  # the collector host (one per fleet)
+  services.hsp.collect = { enable = true; pyroscope = "http://pyroscope.internal:4040"; openFirewall = true; };
+  # every service host: one agent per GHC service, keyed by the process's comm
+  services.hsp.agents.euler-api-txns.collector = "http://collector.internal:4041";
+  services.hsp.agents.euler-webservice = { collector = "http://collector.internal:4041"; hz = 19; labelMode = "full"; };
+}
+```
+
+Options (`nix/module.nix`): per agent `interval` (10), `hz` (49), `labelMode` (tag), `host`, `service`, `spoolMaxMb`,
+`maxBatchMb`, `memoryMax`, `extraArgs`; for the collector `listen`, `pyroscope`, `mapsDir` (`/var/lib/hsp/maps`),
+`dumpDir`, `threads`, `queueMb`, `memoryMax`, `openFirewall`; shared `package`, `user`, `metricsDir`
+(`/var/lib/hsp/metrics`, for node exporter's `--collector.textfile.directory`). `nix flake check` evaluates an example
+host with both (`nixosConfigurations.example`). Maps still arrive through `dist/ci/publish-map.sh`.
+
+## systemd (other distributions)
 ```
 useradd --system --home /var/lib/hsp hsp
 install -Dm644 dist/systemd/hsp-agent@.service dist/systemd/hsp-collect.service /etc/systemd/system/
