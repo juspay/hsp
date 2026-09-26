@@ -273,8 +273,11 @@ Three layers, all from `nix flake check`:
   Continuous path: the unit's agent waits for the program, attaches when it
   starts, the collector pairs the batches with the map by the binary's id,
   and the folded output must be source names, none raw, from a process that
-  runs as `hsp`. Offline path: `tests/smoke.sh` inside the VM. About two
-  minutes with KVM.
+  runs as `hsp`. Offline path: `tests/smoke.sh` inside the VM. 45 s with
+  KVM, two minutes under emulation. Any Linux with nix will do; for KVM
+  inside nix's sandbox on Ubuntu, `/dev/kvm` must be readable by the build
+  users: `echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' >
+  /etc/udev/rules.d/99-kvm-nix.rules`, then `udevadm trigger /dev/kvm`.
 - `sudo tests/smoke.sh [ghc984|ghc98|ghc910|ghc928] [secs] [hz]` on a host:
   the same record/fold checks against a real kernel and CPU (labels, deep
   stacks across chunks, allocation attribution per request, walk cost,
