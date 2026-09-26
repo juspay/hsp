@@ -35,9 +35,21 @@ systemctl enable --now hsp-collect                     # on the collector host
 ```
 
 ## Maps
-On the build host, once per binary: `hsp symmap` produces `<binary>.hsm`; ship it to the collector's `/var/lib/hsp/maps`
-and add a line to `maps.tsv` there: `<exe path>\t<exe size>\t<file>.hsm`.
-A map named `<basename of the exe>.hsm` is found without an index line.
+The collector pairs every batch with the map of the exact build it came from. The agent sends the binary's identity
+(the SHA-256 of the file; `hsp id BIN` prints it) with each batch, `hsp symmap` stores the same id in the map, and the
+collector looks for `<maps dir>/<id>.hsm` first. So the CI step is, once per built binary, before it is deployed:
+
+    dist/ci/publish-map.sh /path/to/service-binary collector-host:/var/lib/hsp/maps
+
+(`hsp symmap BIN --install DIR` is the same without the copy.) A map that lands after the binary is already running is
+picked up on the next batch, no restart; the agent spools batches until then (`--spool`). A changed map file is reloaded.
+
+Older forms still work: a `maps.tsv` line `<exe path>\t<exe size>\t<file>.hsm`, or a file named `<basename of exe>.hsm`.
+A map found that way is refused (`wrong build` in the log and in `hsp_collect_batches_wrong_map_total`) when both it
+and the batch carry an id and they differ.
+
+Maps stay mmap'd once used. `/stats` lists them with their batch counts; `--threads` (default 4) is how many batches
+resolve at once, `--queue-mb` (default 256) bounds what waits for Pyroscope.
 
 ## Metrics
 The agent writes Prometheus text to `--metrics-file` every interval (for

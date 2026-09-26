@@ -63,6 +63,8 @@ object; bpftool for the skeleton. Linux 5.8+ (CAP_BPF/CAP_PERFMON), x86-64.
 ```bash
 # once per binary, on the build host: the name map, straight from the ELF
 hsp symmap ./my-service my-service.hsm
+# for a fleet: named by the binary's identity, into the collector's maps dir
+hsp symmap ./my-service --install /var/lib/hsp/maps      # or dist/ci/publish-map.sh BIN host:/dir
 
 # a one-off capture (root): 99 Hz per CPU by default, until the target exits or -t secs
 sudo hsp record -F 99 -t 60 -o cap.bin -p $(pgrep -x my-service)
@@ -158,10 +160,25 @@ CAP_SYS_PTRACE` (`dist/INSTALL.md`, `dist/systemd/`). Every interval it folds
 the samples since the last one into distinct stacks of raw info pointers with
 a count and the bytes the green threads allocated, and POSTs them to the
 collector (`src/wire.h`). The host holds no map and resolves nothing. The
-collector matches the map by executable path and size (`maps.tsv`, or
-`<basename>.hsm`), names the stacks and pushes `<service>.cpu` (samples) and
-`<service>.alloc_space` (bytes) to Pyroscope with `host` and `pid` labels.
-When the collector is unreachable the agent spools to disk and retries.
+batch carries the binary's identity, the SHA-256 of the file (`src/exeid.h`;
+`hsp id BIN` prints it), hashed once at attach; `symmap` stores the same id
+in the map, so the collector opens `<maps dir>/<id>.hsm` for exactly that
+build, wherever it runs and whatever it is called (GHC and nix emit no
+build-id, and a hash also tells a stripped copy from an unstripped one). The
+older forms, `maps.tsv` lines of executable path and size or a
+`<basename>.hsm`, still work, but such a map is refused when its id and the
+batch's differ. A map that lands after the service is running is picked up
+on the next batch; a changed file is reloaded. The collector names the stacks
+and pushes `<service>.cpu` (samples) and `<service>.alloc_space` (bytes) to
+Pyroscope with `host` and `pid` labels. When the collector is unreachable, or
+has no map yet, the agent spools to disk and retries.
+
+The collector resolves batches on `--threads` handlers (default 4), one at a
+time per map, and hands the folded profiles to one pusher thread through a
+bounded queue (`--queue-mb`, default 256; oldest dropped and counted when
+full, three tries per push), so a slow or restarting Pyroscope never blocks
+an agent's POST. `GET /stats` and `GET /metrics` show the queue, the pushes
+and the batches rejected for a missing or wrong map.
 
 Operability: `--metrics-file` writes Prometheus text every interval (for
 node_exporter's textfile collector; the collector serves `GET /metrics`);

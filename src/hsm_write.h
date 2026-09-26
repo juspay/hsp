@@ -28,6 +28,8 @@ struct Input {
   std::vector<std::pair<uint64_t, uint64_t>> exec_ranges;   // sorted
   int64_t info_delta = 0;
   Lines lines;
+  uint8_t exe_id[32] = {};   // exeid::of_file(BIN)
+  uint64_t exe_size = 0;
 };
 
 // Writes OUT.hsm atomically; throws std::runtime_error.  Prints a summary to stderr.

@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <stdexcept>
 
@@ -25,7 +26,9 @@ Map Map::open(const char* path) {
   m.base_ = static_cast<const char*>(p);
   m.len_ = st.st_size;
   m.h_ = m.at<Header>(0);
-  if (m.len_ < sizeof(Header) || std::memcmp(m.h_->magic, MAGIC, 8) != 0)
+  m.v2_ = m.len_ >= sizeof(Header) && std::memcmp(m.h_->magic, MAGIC, 8) == 0;
+  bool v1 = m.len_ >= offsetof(Header, exe_id) && std::memcmp(m.h_->magic, MAGIC_V1, 8) == 0;
+  if (!m.v2_ && !v1)
     throw std::runtime_error(std::string(path) + ": not an hsp map (" + std::string(m.h_->magic, 8) + ")");
   const Header& h = *m.h_;
   m.e_ = m.at<Entry>(h.entries);

@@ -14,7 +14,8 @@
 
 namespace hsm {
 
-constexpr char MAGIC[8] = {'H', 'S', 'P', 'M', 'A', 'P', '0', '1'};
+constexpr char MAGIC[8] = {'H', 'S', 'P', 'M', 'A', 'P', '0', '2'};      // written
+constexpr char MAGIC_V1[8] = {'H', 'S', 'P', 'M', 'A', 'P', '0', '1'};   // still read: no exe_id
 
 // A string is a u32 offset into the string table; offset 0 is "" and stands
 // for Python's None (the Python code only ever tests these for truthiness).
@@ -39,6 +40,9 @@ struct Header {
   uint64_t ow_addr, ow_idx;                       // symtab entries in .text
   uint64_t ln_addr, ln_file, ln_line;             // DWARF rows
   uint64_t bspans;                                // sorted by (module, file)
+  // HSPMAP02: which binary this map is for (exeid.h); zero in a 01 map
+  uint8_t exe_id[32];
+  uint64_t exe_size;
 };
 
 // What a resolver returns: an entry plus what resolve_extent / resolve_leaf
@@ -61,6 +65,7 @@ class Map {
 
   std::string_view str(uint32_t off) const { return strs_ + off; }
   const Header& header() const { return *h_; }
+  bool has_exe_id() const { return v2_; }   // a 01 map has no id: pair it by path + size only
   std::tuple<uint64_t, uint32_t, uint32_t> line_row(uint64_t i) const { return {ln_addr_[i], ln_file_[i], ln_line_[i]}; }
   const BSpan& bspan(uint64_t i) const { return bs_[i]; }
   uint64_t n_lines() const { return h_->n_lines; }
@@ -97,6 +102,7 @@ class Map {
   const uint32_t *iv_idx_, *cs_idx_, *ow_idx_, *ln_file_, *ln_line_;
   const BSpan* bs_ = nullptr;
   bool lines_ = true;
+  bool v2_ = false;
 };
 
 // _atomic(e): code that ends at its st_size (a constructor's entry, a C function)

@@ -45,6 +45,7 @@ void write_hsm(const Input& in, const std::string& outp) {
   Header h{};
   std::memcpy(h.magic, MAGIC, 8);
   h.info_delta = in.info_delta;
+  std::memcpy(h.exe_id, in.exe_id, 32); h.exe_size = in.exe_size;
 
   std::vector<hsm::Entry> E;
   E.reserve(in.entries.size());

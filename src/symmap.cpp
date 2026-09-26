@@ -34,6 +34,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "exeid.h"
 #include "hsm_write.h"
 #include "zdecode.h"
 
@@ -582,11 +583,21 @@ hsmw::Lines dwarf_lines(const std::string& path) {
 }  // namespace
 
 int cmd_symmap(int argc, char** argv) {
-  if (argc < 2) { std::fprintf(stderr, "usage: hsp symmap BIN OUT.hsm [--eventlog FILE] [--no-dwarf] [--user-packages a,b]\n"); return 2; }
-  std::string bin = argv[0], outp = argv[1], eventlog;
+  if (argc < 2) { std::fprintf(stderr, "usage: hsp symmap BIN (OUT.hsm | --install MAPS_DIR) [--eventlog FILE] [--no-dwarf] [--user-packages a,b]\n"); return 2; }
+  std::string bin = argv[0], outp, eventlog;
   bool dwarf = true;
   std::unordered_set<std::string> user;
-  for (int i = 2; i < argc; i++) {
+  // the binary's identity goes into the map; with --install the file is named by it,
+  // which is how the collector finds it (MAPS_DIR/<id>.hsm)
+  exeid::Id id; uint64_t bin_size = 0;
+  if (!exeid::of_file(bin.c_str(), id, &bin_size)) { std::fprintf(stderr, "hsp symmap: cannot read %s\n", bin.c_str()); return 2; }
+  int first = 2;
+  if (!strcmp(argv[1], "--install")) {
+    if (argc < 3) { std::fprintf(stderr, "hsp symmap: --install needs MAPS_DIR\n"); return 2; }
+    outp = std::string(argv[2]) + "/" + exeid::hex(id) + ".hsm"; first = 3;
+  } else outp = argv[1];
+  std::fprintf(stderr, "binary %s: %lu bytes, id %s\n", bin.c_str(), (unsigned long)bin_size, exeid::hex(id).c_str());
+  for (int i = first; i < argc; i++) {
     if (!strcmp(argv[i], "--eventlog") && i + 1 < argc) eventlog = argv[++i];
     else if (!strcmp(argv[i], "--no-dwarf")) dwarf = false;
     else if (!strcmp(argv[i], "--user-packages") && i + 1 < argc) {
@@ -885,6 +896,8 @@ int cmd_symmap(int argc, char** argv) {
     in.lines = dwarf_lines(bin);
     std::fprintf(stderr, "DWARF rows %zu\n", in.lines.addr.size());
   }
+  std::memcpy(in.exe_id, id.data(), 32); in.exe_size = bin_size;
   hsmw::write_hsm(in, outp);
+  std::printf("%s\n", outp.c_str());   // stdout: the map's path, for scripts
   return 0;
 }

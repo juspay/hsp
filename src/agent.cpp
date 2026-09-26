@@ -36,6 +36,7 @@
 #include "capture.h"
 #include "hsp_abi.h"
 #include "sampler.h"
+#include "exeid.h"
 #include "wire.h"
 
 namespace {
@@ -92,8 +93,16 @@ struct Agent {
   hs_sampler* sampler = nullptr;
   const struct hs_sampler_info* info = nullptr;
   std::string exe; uint64_t exe_size = 0; uint32_t pid = 0;
+  exeid::Id exe_id{};      // computed once at attach; zero if the file could not be read
 
   void flush(bool early = false);
+
+  // hash the executable once; the collector pairs the batch with its map by this
+  void identify() {
+    std::string path = pid ? "/proc/" + std::to_string(pid) + "/exe" : exe;   // the running image, even if the path was replaced
+    if (!exeid::of_file(path.c_str(), exe_id) && !exeid::of_file(exe.c_str(), exe_id))
+      std::fprintf(stderr, "hsp agent: cannot hash %s: the collector will go by path + size\n", exe.c_str());
+  }
 
   std::string label_of(const RawSample& s) {
     if (label_mode == "none" || s.label.empty() || s.label == "-") return "";
@@ -149,7 +158,7 @@ struct Agent {
     std::string o;
     wire_hdr h{};
     std::memcpy(h.magic, WIRE_MAGIC, 8);
-    h.version = 1; h.hdr_size = sizeof h;
+    h.version = 2; h.hdr_size = sizeof h;
     h.from_ns = batch.from_ns; h.until_ns = batch.until_ns ? batch.until_ns : batch.from_ns;
     h.freq_hz = freq; h.pid = pid; h.exe_size = exe_size;
     h.n_labels = batch.labels.size(); h.n_stacks = batch.stacks.size(); h.n_samples = batch.samples;
@@ -157,6 +166,7 @@ struct Agent {
     else std::snprintf(h.host, sizeof h.host, "%s", host.c_str());
     std::snprintf(h.service, sizeof h.service, "%s", service.c_str());
     std::snprintf(h.exe, sizeof h.exe, "%s", exe.c_str());
+    std::memcpy(h.exe_id, exe_id.data(), 32);
     o.append(reinterpret_cast<const char*>(&h), sizeof h);
     for (const std::string& l : batch.labels) {
       uint16_t n = std::min<size_t>(l.size(), 65535);
@@ -175,6 +185,9 @@ struct Agent {
     if (!c) return false;
     std::string url = collector + "/v1/profile";
     curl_slist* hdrs = curl_slist_append(nullptr, "Content-Type: application/octet-stream");
+    // curl adds "Expect: 100-continue" to large bodies and waits a second for a
+    // server that never answers it; the collector reads the body straight away
+    hdrs = curl_slist_append(hdrs, "Expect:");
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
     curl_easy_setopt(c, CURLOPT_POST, 1L);
     curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.data());
@@ -388,6 +401,7 @@ int cmd_agent(int argc, char** argv) {
     }
     struct stat st{};
     if (stat(a.exe.c_str(), &st) == 0) a.exe_size = st.st_size;
+    a.identify();
     if (a.service.empty()) a.service = a.exe.substr(a.exe.rfind('/') + 1);
     uint64_t first = 0;
     read_capture(capture.c_str(), [&](RawSample& s) {
@@ -410,6 +424,7 @@ int cmd_agent(int argc, char** argv) {
   a.sampler = s;
   a.info = hs_sampler_info(s);
   a.exe = a.info->exe; a.exe_size = a.info->exe_size; a.pid = pid;
+  a.identify();
   if (a.service.empty()) a.service = a.exe.substr(a.exe.rfind('/') + 1);
   std::fprintf(stderr, "hsp agent: pid %d, %s, GHC %d.%d, %u Hz x %d CPUs, every %.0f s -> %s (service %s)\n",
                pid, a.info->exe, a.info->ghc_major, a.info->ghc_minor, a.info->freq_hz, a.info->cpus, interval,
