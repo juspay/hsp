@@ -263,13 +263,25 @@ interval, nearest-preceding-code extent, DWARF line rescue) are in
 
 ## Tests
 
-```bash
-make test                          # bpf/hswalk.h on synthetic stacks, no root
-tests/smoke/build.sh               # tests/testprog for GHC 9.8 and 9.10 (haskell-flake) + maps
-GHC928=/path/to/ghc-9.2.8 tests/smoke/build.sh ghc928   # 9.2 is no longer in nixpkgs: point at one
-sudo tests/smoke.sh [ghc984|ghc910|ghc928]              # live: labels, callers, 300-deep walks, alloc, per-request alloc, DWARF naming, cost
-```
+Three layers, all from `nix flake check`:
 
+- `make test`: the stack walker against synthetic frames (`tests/hswalk_test.c`).
+- `make e2e` (`checks.e2e`): the suite a developer or CI runs without root
+  or setup. A NixOS VM boots with the module (`hsp-collect` and an
+  `hsp-agent` as the `hsp` user with its three capabilities) and the test
+  program, built in the flake for GHC 9.8.4 with the flags a service needs.
+  Continuous path: the unit's agent waits for the program, attaches when it
+  starts, the collector pairs the batches with the map by the binary's id,
+  and the folded output must be source names, none raw, from a process that
+  runs as `hsp`. Offline path: `tests/smoke.sh` inside the VM. About two
+  minutes with KVM.
+- `sudo tests/smoke.sh [ghc984|ghc98|ghc910|ghc928] [secs] [hz]` on a host:
+  the same record/fold checks against a real kernel and CPU (labels, deep
+  stacks across chunks, allocation attribution per request, walk cost,
+  the resolution gate, and that DWARF-line naming never names code a run
+  did not execute). `tests/smoke/build.sh` builds the program and its map
+  per GHC first. `HSP_SMOKE_COST_NS` raises the walk-cost bound (a VM is
+  slower).
 ## Layout
 
 | | |

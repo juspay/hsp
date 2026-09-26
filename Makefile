@@ -45,10 +45,14 @@ build:
 test: build/hswalk_test
 	./build/hswalk_test
 
+# the end-to-end test in a NixOS VM (no root needed): the module, an agent, the collector, the test program
+e2e:
+	nix build .#checks.x86_64-linux.e2e -L --no-link
+
 install: build/hsp
 	install -Dm755 build/hsp $(PREFIX)/bin/hsp
 
 clean:
 	rm -rf build
 
-.PHONY: test install clean
+.PHONY: test e2e install clean

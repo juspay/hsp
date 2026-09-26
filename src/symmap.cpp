@@ -722,9 +722,13 @@ int cmd_symmap(int argc, char** argv) {
       }
     }
     if (q.toplevel.empty()) {
-      // $wfoo is foo's worker: on a real name (a label, or a decoded symbol),
-      // never on a bare table name like $wgo_sbY7_info
+      // $wfoo is foo's worker: on a label, a decoded symbol, or, failing both,
+      // the table name itself without its _info ($wgo1_r43J_info -> go1): the
+      // closure's own name, as the symbol table names its _entry.  Without it
+      // the entry would be guessed by address, and a floated loop of one
+      // binding sits next to another's code (go1 after deep: named deep).
       std::string base = q.sym >= 0 ? entries[q.sym].name : p.label;
+      if (base.empty() && p.table_name.ends_with("_info")) base = p.table_name.substr(0, p.table_name.size() - 5);
       std::string cand = worker_parent(base);
       if (!cand.empty() && !cand.ends_with("_info")) { q.toplevel = cand; q.how = "worker-name"; }
     }

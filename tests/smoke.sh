@@ -64,7 +64,8 @@ check $(( d > 0 ? 0 : 1 )) "deep: stacks of >= 300 frames reached STOP ($d sampl
 a=$(grep -E 'Main\.allocy' "$ALLOC" | awk '{s+=$NF} END{print s+0}')
 check $(( a > 1000000 ? 0 : 1 )) "alloc: $a bytes attributed to allocy (expected > 1 MB)"
 p50=$(grep -oE 'walk cost ns +p50 [0-9]+' "$O/agg.txt" | awk '{print $NF}' | head -1)
-check $(( ${p50:-999999} < 5000 ? 0 : 1 )) "cost: median walk ${p50:-?} ns (expected < 5000)"
+# a VM walks slower (nested paging, no KVM PMU): the e2e check raises this
+check $(( ${p50:-999999} < ${HSP_SMOKE_COST_NS:-5000} ? 0 : 1 )) "cost: median walk ${p50:-?} ns (expected < ${HSP_SMOKE_COST_NS:-5000})"
 check $frc "fold exit $frc (resolution gate)"
 
 if [ $LABELS = 1 ]; then   # per-request attribution needs labels

@@ -414,13 +414,36 @@ int cmd_agent(int argc, char** argv) {
   }
 
   if (pid == 0) {
-    pid = find_by_comm(name);
-    if (!pid) { std::fprintf(stderr, "hsp agent: no process named %s\n", name.c_str()); return 1; }
+    // --name: wait for the process rather than exit, so a unit started before
+    // its service (boot, a deploy) sits here instead of tripping systemd's
+    // start limit; after the target exits the agent exits and Restart= brings
+    // it back to this wait
+    bool said = false;
+    while (!(pid = find_by_comm(name)) && !stop_requested) {
+      if (!said) { std::fprintf(stderr, "hsp agent: no process named %s yet; waiting\n", name.c_str()); said = true; }
+      sleep(2);
+    }
+    if (!pid) return 0;
   }
   char err[512];
-  hs_sampler* s = hs_sampler_attach(pid, nullptr, &o, +[](void* ctx, const hs_rec* r, size_t) -> int {
-    RawSample raw; rec_to_raw(r, raw); static_cast<Agent*>(ctx)->add(raw); return 0; }, &a, err, sizeof err);
-  if (!s) { std::fprintf(stderr, "hsp agent: %s\n", err); return 2; }
+  auto attach = [&]() {
+    return hs_sampler_attach(pid, nullptr, &o, +[](void* ctx, const hs_rec* r, size_t) -> int {
+      RawSample raw; rec_to_raw(r, raw); static_cast<Agent*>(ctx)->add(raw); return 0; }, &a, err, sizeof err);
+  };
+  hs_sampler* s = attach();
+  // --name: an attach that fails (the process is mid-exec, its executable is
+  // not visible from here, a same-named process that is not the service) is
+  // retried, not fatal: exiting would trip the unit's start limit and leave
+  // the service unprofiled once it does come up
+  while (!s && !name.empty() && !stop_requested) {
+    std::fprintf(stderr, "hsp agent: pid %d: %s; retrying in 5 s\n", pid, err);
+    sleep(5);
+    pid = 0;
+    while (!(pid = find_by_comm(name)) && !stop_requested) sleep(2);
+    if (!pid) return 0;
+    s = attach();
+  }
+  if (!s) { if (!stop_requested) std::fprintf(stderr, "hsp agent: %s\n", err); return stop_requested ? 0 : 2; }
   a.sampler = s;
   a.info = hs_sampler_info(s);
   a.exe = a.info->exe; a.exe_size = a.info->exe_size; a.pid = pid;
