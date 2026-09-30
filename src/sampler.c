@@ -2,6 +2,7 @@
  * events, ring buffer.  C: the bpftool skeleton is a C header. */
 #define _GNU_SOURCE
 #include "sampler.h"
+#include "ghcver.h"
 
 #include <elf.h>
 #include <errno.h>
@@ -47,24 +48,16 @@ struct elf_facts {
     int ghc_major, ghc_minor;
 };
 
-/* The GHC version the binary was built with: the RTS info table (what
- * `+RTS --info' prints) keeps it in .rodata as a bare "9.x.y" string. */
+/* The version string lives in .rodata; src/ghcver.h does the scanning, and
+ * `hsp symmap' reads it the same way. */
 static void find_ghc_version(const unsigned char *m, const Elf64_Ehdr *eh, struct elf_facts *f)
 {
     const Elf64_Shdr *sh = (const Elf64_Shdr *)(m + eh->e_shoff);
     const char *names = (const char *)(m + sh[eh->e_shstrndx].sh_offset);
     for (int i = 0; i < eh->e_shnum; i++) {
         if (sh[i].sh_type != SHT_PROGBITS || strncmp(names + sh[i].sh_name, ".rodata", 7)) continue;
-        const char *p = (const char *)(m + sh[i].sh_offset), *end = p + sh[i].sh_size;
-        for (const char *q = p; q + 8 < end; q++) {
-            if (q[0] != '9' || q[1] != '.') continue;
-            if (q > p && q[-1] != 0) continue;
-            int a, b, c;
-            if (sscanf(q, "%d.%d.%d", &a, &b, &c) == 3 && a == 9 && b < 20) {
-                const char *z = q; while (z < end && *z) z++;
-                if (z - q <= 8) { f->ghc_major = a; f->ghc_minor = b; return; }
-            }
-        }
+        const char *p = (const char *)(m + sh[i].sh_offset);
+        if (ghcver_find(p, p + sh[i].sh_size, &f->ghc_major, &f->ghc_minor)) return;
     }
 }
 

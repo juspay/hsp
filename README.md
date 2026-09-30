@@ -146,12 +146,17 @@ program is sampled without them.
 | GHC | sampler | names (IPE) | labels |
 |---|---|---|---|
 | 9.2 | yes (`alloc_limit` at its 9.2 offset) | read from the `_ipe` `InfoProvEnt` symbols; closures and stack frames (no `-with-stack` flag needed) | no (the TSO has no label field before 9.6) |
-| 9.8 | yes | read from the static IPE nodes in the ELF | yes |
+| 9.8 | yes | read from the static IPE nodes in the ELF, zstd-compressed or not | yes |
 | 9.10 | yes (`StgTSO` gained a word) | from an eventlog: `hsp symmap BIN OUT --eventlog E` after one run with `+RTS -l` (the 9.10 node layout is not read yet) | yes |
 
 The offsets are chosen by the loader from the GHC version string in the
 binary; an unknown version gets 9.8's and a warning. Frame-type numbers are
 the same across these versions.
+
+That string is not always `9.x.y`: a hadrian tree emits `9.8.4.20260910`, and
+GHC 10 exists. `src/ghcver.h` is the one scanner both the loader and `hsp
+symmap` use, so they cannot disagree about which GHC a binary is, and
+`tests/ghcver_test.c` pins the shapes it must and must not accept.
 
 ## Continuous profiling
 
@@ -265,7 +270,11 @@ interval, nearest-preceding-code extent, DWARF line rescue) are in
 
 Three layers, all from `nix flake check`:
 
-- `make test`: the stack walker against synthetic frames (`tests/hswalk_test.c`).
+- `make test`: the stack walker against synthetic frames
+  (`tests/hswalk_test.c`) and the GHC version scan (`tests/ghcver_test.c`).
+- `tests/ipe.sh [BINARY]`: that `hsp symmap` reads a zstd-compressed IPE node.
+  A GHC configured without zstd never emits one, so the fixture is made by
+  recompressing a real binary's node in place (`tests/mkzstd-ipe.py`). No root.
 - `make e2e` (`checks.e2e`): the suite a developer or CI runs without root
   or setup. A NixOS VM boots with the module (`hsp-collect` and an
   `hsp-agent` as the `hsp` user with its three capabilities) and the test
@@ -296,7 +305,7 @@ Three layers, all from `nix flake check`:
 | `src/hsm.*`, `src/naming.h`, `src/fold.cpp`, `src/dump.cpp` | reading the map; naming; the report |
 | `src/capture.*`, `src/wire.h` | file formats: captures, agent -> collector batches |
 | `stack/`, `dist/` | the UI stack module; systemd units, capabilities, install notes |
-| `tests/` | the walker test, the test program, the live smoke test |
+| `tests/` | the walker, version-scan and IPE tests, the test program, the live smoke test |
 | `nix/module.nix` | the NixOS module: collector and agents as systemd units |
 
 ## Next

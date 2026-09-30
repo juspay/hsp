@@ -1,5 +1,5 @@
 # hsp: `make` builds build/hsp; `make test` runs the host-side walker test.
-# Toolchain (g++, clang for BPF, bpftool, libbpf, yyjson, zlib) comes from
+# Toolchain (g++, clang for BPF, bpftool, libbpf, libzstd, yyjson, zlib) comes from
 # `nix develop` / `nix build`; plain make works where they are installed.
 CXX      ?= g++
 CC       ?= cc
@@ -9,7 +9,7 @@ CXXFLAGS ?= -O2 -g
 CFLAGS   ?= -O2 -g
 CXXFLAGS += -std=c++20 -Wall -Wextra
 CFLAGS   += -Wall -Wextra -Wno-unused-parameter
-DEPS      = libbpf libcurl libdw libelf
+DEPS      = libbpf libcurl libdw libelf libzstd
 CPPFLAGS += $(shell pkg-config --cflags $(DEPS)) -Ibpf -Ibuild
 LDLIBS   += $(shell pkg-config --libs $(DEPS))
 BPF_CFLAGS ?= $(shell pkg-config --cflags libbpf)
@@ -39,11 +39,15 @@ build/hsp.skel.h: build/hsp.bpf.o
 build/hswalk_test: tests/hswalk_test.c bpf/hswalk.h bpf/hsp_abi.h | build
 	$(CC) $(CFLAGS) -Ibpf -o $@ $<
 
+build/ghcver_test: tests/ghcver_test.c src/ghcver.h | build
+	$(CC) $(CFLAGS) -Isrc -o $@ $<
+
 build:
 	mkdir -p build
 
-test: build/hswalk_test
+test: build/hswalk_test build/ghcver_test
 	./build/hswalk_test
+	./build/ghcver_test
 
 # the end-to-end test in a NixOS VM (no root needed): the module, an agent, the collector, the test program
 e2e:
