@@ -9,7 +9,7 @@
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
-      deps = [ pkgs.libbpf pkgs.elfutils pkgs.curl ];
+      deps = [ pkgs.libbpf pkgs.elfutils pkgs.curl pkgs.zstd ];
       # the BPF target needs the unwrapped clang: nix's wrapper adds x86-only
       # hardening flags (-fzero-call-used-regs) that clang rejects for bpf
       bpfClang = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";

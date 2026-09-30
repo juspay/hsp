@@ -36,7 +36,11 @@
 
 #include "exeid.h"
 #include "hsm_write.h"
+#include "ghcver.h"
 #include "zdecode.h"
+#ifndef HSP_NO_ZSTD
+#include <zstd.h>
+#endif
 
 namespace {
 
@@ -73,6 +77,17 @@ struct ElfFile {
     const Section& s = secs[*std::prev(it)];
     if (va + n > s.addr + s.size) return nullptr;
     return m + s.off + (va - s.addr);
+  }
+
+  // Bytes from `va' to the end of its section, 0 if none covers it: the bound
+  // a zstd frame's length must be discovered within, since an IPE node records
+  // only the DEcompressed size of what it points at.
+  size_t avail_at_va(uint64_t va) const {
+    auto it = std::upper_bound(by_addr.begin(), by_addr.end(), va, [&](uint64_t v, size_t i) { return v < secs[i].addr; });
+    if (it == by_addr.begin()) return 0;
+    const Section& s = secs[*std::prev(it)];
+    if (va < s.addr || va >= s.addr + s.size) return 0;
+    return s.addr + s.size - va;
   }
   const Section* section(std::string_view name) const {
     for (auto& s : secs) if (s.name == name) return &s;
@@ -290,22 +305,35 @@ struct SpanIndex {
 
 // ---------------------------------------------------------------- IPE
 
-// The GHC version the binary was built with: the RTS info table keeps it in
-// .rodata as a bare NUL-terminated "9.x.y" string (what `+RTS --info' prints).
+// The GHC version the binary was built with, from the first .rodata section
+// that has it (src/ghcver.h; the loader reads the same string the same way).
 std::pair<int, int> ghc_version(const ElfFile& E) {
-  const Section* ro = E.section(".rodata");
-  if (!ro) return {0, 0};
-  const char* p = reinterpret_cast<const char*>(E.m + ro->off); const char* end = p + ro->size;
-  for (const char* q = p; q + 8 < end; q++) {
-    if (q[0] != '9' || q[1] != '.' || (q > p && q[-1] != 0)) continue;
-    int a, b, c;
-    if (sscanf(q, "%d.%d.%d", &a, &b, &c) == 3 && a == 9 && b < 20) {
-      const char* z = q; while (z < end && *z) z++;
-      if (z - q <= 8) return {a, b};
-    }
+  int maj = 0, min_ = 0;
+  for (const Section& s : E.secs) {
+    if (s.type != SHT_PROGBITS || s.name.compare(0, 7, ".rodata") != 0) continue;
+    const char* p = reinterpret_cast<const char*>(E.m + s.off);
+    if (ghcver_find(p, p + s.size, &maj, &min_)) return {maj, min_};
   }
   return {0, 0};
 }
+
+// A zstd frame at `va'.  Its compressed length is recorded nowhere, so
+// ZSTD_findFrameCompressedSize reads it out of the frame header, bounded by
+// what is left in the section.
+#ifndef HSP_NO_ZSTD
+static bool unzstd_at(const ElfFile& E, uint64_t va, uint64_t out_size, std::vector<unsigned char>& out) {
+  size_t avail = E.avail_at_va(va);
+  const unsigned char* p = avail ? E.at_va(va, 1) : nullptr;
+  if (!p || !out_size) return false;
+  size_t csz = ZSTD_findFrameCompressedSize(p, avail);
+  if (ZSTD_isError(csz) || csz > avail) return false;
+  out.resize(out_size);
+  size_t got = ZSTD_decompress(out.data(), out_size, p, csz);
+  return !ZSTD_isError(got) && got == out_size;
+}
+#else
+static bool unzstd_at(const ElfFile&, uint64_t, uint64_t, std::vector<unsigned char>&) { return false; }
+#endif
 
 struct Ipe { uint64_t info; std::string table_name; int closure_desc; std::string ty_desc, label, module, src_file, src_span; };
 
@@ -317,18 +345,30 @@ std::vector<Ipe> ipe_from_elf(const ElfFile& E, const std::vector<Sym>& syms, st
   std::vector<std::pair<std::string, uint64_t>> nodes;   // by name, as `nm` lists them
   for (auto& s : syms) if (s.name.ends_with("_ipe_buf")) nodes.push_back({s.name, s.addr});
   std::sort(nodes.begin(), nodes.end());
-  size_t compressed = 0, bad = 0;
+  size_t compressed = 0, skipped = 0, bad = 0;
   for (auto& [nm, addr] : nodes) {
     const unsigned char* p = E.at_va(addr, 64);
     if (!p) { bad++; continue; }
     uint64_t f[8]; memcpy(f, p, 64);
     uint64_t comp = f[1], count = f[2], tables = f[3], entries = f[4], esize = f[5], strtab = f[6], ssize = f[7];
-    if (comp) { compressed++; continue; }
-    if (esize != count * 32) { bad++; continue; }
+    if (esize != count * 32) { bad++; continue; }   // a DEcompressed size either way
     if (!count) continue;
-    const unsigned char* tabs = E.at_va(tables, 8 * count);
-    const unsigned char* raw = E.at_va(entries, esize);
-    const unsigned char* st = ssize ? E.at_va(strtab, ssize) : nullptr;
+    const unsigned char* tabs = E.at_va(tables, 8 * count);   // pointers: never compressed
+    const unsigned char* raw = nullptr;
+    const unsigned char* st = nullptr;
+    std::vector<unsigned char> ebuf, sbuf;   // must outlive `str' below
+    if (comp) {
+      // One zstd frame for the entries and one for the string table; both
+      // *_size fields are the decompressed sizes
+      // (rts/IPE.c decompressIPEBufferListNodeIfCompressed).
+      if (!unzstd_at(E, entries, esize, ebuf) || (ssize && !unzstd_at(E, strtab, ssize, sbuf))) { skipped++; continue; }
+      compressed++;
+      raw = ebuf.data();
+      st = ssize ? sbuf.data() : nullptr;
+    } else {
+      raw = E.at_va(entries, esize);
+      st = ssize ? E.at_va(strtab, ssize) : nullptr;
+    }
     if (!tabs || !raw || (ssize && !st)) { bad++; continue; }
     auto str = [&](uint32_t off) -> std::string {
       if (off >= ssize) return "";
@@ -342,8 +382,12 @@ std::vector<Ipe> ipe_from_elf(const ElfFile& E, const std::vector<Sym>& syms, st
       out.push_back({info, str(idx[0]), all_digits(cd) ? (int)num(cd) : -1, str(idx[2]), str(idx[3]), str(idx[4]), str(idx[5]), str(idx[6])});
     }
   }
-  note = std::to_string(nodes.size()) + " IPE nodes in the ELF, " + std::to_string(compressed) + " compressed (unsupported), " +
-         std::to_string(bad) + " unreadable (a different GHC's layout?)";
+  note = std::to_string(nodes.size()) + " IPE nodes in the ELF, " + std::to_string(compressed) + " zstd-compressed (decompressed), " +
+         std::to_string(skipped) + " compressed but unreadable" +
+#ifdef HSP_NO_ZSTD
+         " (built without zstd)" +
+#endif
+         ", " + std::to_string(bad) + " unreadable (a different GHC's layout?)";
   return out;
 }
 
@@ -617,9 +661,23 @@ int cmd_symmap(int argc, char** argv) {
   auto [gmaj, gmin] = ghc_version(E);
   std::fprintf(stderr, "GHC %d.%d\n", gmaj, gmin);
   std::vector<Ipe> ipes;
-  if (!eventlog.empty()) ipes = ipe_from_eventlog(eventlog);
-  else if (gmaj == 9 && gmin <= 4) ipes = ipe_from_elf_92(E, syms, note);
-  else ipes = ipe_from_elf(E, syms, note);
+  if (!eventlog.empty()) {
+    ipes = ipe_from_eventlog(eventlog);
+  } else {
+    // The version is a hint, not a gate: `ghc_version' can fail to find the
+    // string at all, and choosing the wrong layout then reports every node as
+    // unreadable.  Try the likelier reader, fall back to the other on nothing.
+    bool legacy_first = gmaj == 9 && gmin <= 4;
+    std::string note_alt;
+    ipes = legacy_first ? ipe_from_elf_92(E, syms, note) : ipe_from_elf(E, syms, note);
+    if (ipes.empty()) {
+      std::vector<Ipe> alt = legacy_first ? ipe_from_elf(E, syms, note_alt) : ipe_from_elf_92(E, syms, note_alt);
+      if (!alt.empty()) {
+        ipes = std::move(alt);
+        note = note_alt + (legacy_first ? " [9.6+ layout]" : " [9.2/9.4 layout]");
+      }
+    }
+  }
   if (ipes.empty() && eventlog.empty())
     std::fprintf(stderr, "hsp symmap: no IPE found in the ELF (built without -finfo-table-map, or a layout this reader lacks: GHC 9.10 needs --eventlog)\n");
   size_t ret_frames = 0; for (auto& p : ipes) if (is_return_frame(p.closure_desc)) ret_frames++;
