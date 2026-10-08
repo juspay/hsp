@@ -120,13 +120,61 @@ static int load_base(pid_t pid, const char *exe, uint64_t *base)
     return rc;
 }
 
-static int perf_open_cpu(int cpu, unsigned freq)
+static int pmu_type(const char *pmu)
 {
-    struct perf_event_attr attr = {
-        .type = PERF_TYPE_SOFTWARE, .size = sizeof attr, .config = PERF_COUNT_SW_CPU_CLOCK,
-        .sample_freq = freq, .freq = 1,
-    };
-    return syscall(SYS_perf_event_open, &attr, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+    char path[128]; int t = -1;
+    snprintf(path, sizeof path, "/sys/bus/event_source/devices/%s/type", pmu);
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    if (fscanf(fp, "%d", &t) != 1) t = -1;
+    fclose(fp);
+    return t;
+}
+
+/* Which event drives the sampling.  All three are opened in frequency mode,
+ * so -F means the same thing and a sample is still ~1/freq s of CPU.
+ *
+ *   cpu-clock  an hrtimer.  Works everywhere, including a guest with no PMU,
+ *              but the IP is wherever the timer interrupt happened to land.
+ *   cycles     the CPU's cycle counter.  Needs a (virtual) PMU.
+ *   ibs        AMD Instruction-Based Sampling, op sampling counting cycles
+ *              (config 0: IbsOpCntCtl clear).  The kernel replaces the
+ *              interrupt IP with the tagged op's own address, so the leaf is
+ *              exact rather than skidded.  The other registers are still the
+ *              interrupt's, a few instructions later, so a sample whose stack
+ *              pointer has already moved to another TSO fails the walk and is
+ *              counted as broken rather than misattributed.  Needs the ibs_op
+ *              PMU: bare metal, or a guest the host passes IBS through to.
+ */
+static int perf_attr_for(const char *ev, unsigned freq, struct perf_event_attr *attr,
+                         char *err, size_t errlen)
+{
+    memset(attr, 0, sizeof *attr);
+    attr->size = sizeof *attr;
+    attr->sample_freq = freq;
+    attr->freq = 1;
+    if (!ev || !strcmp(ev, "cpu-clock")) {
+        attr->type = PERF_TYPE_SOFTWARE; attr->config = PERF_COUNT_SW_CPU_CLOCK;
+    } else if (!strcmp(ev, "cycles")) {
+        attr->type = PERF_TYPE_HARDWARE; attr->config = PERF_COUNT_HW_CPU_CYCLES;
+    } else if (!strcmp(ev, "ibs")) {
+        int t = pmu_type("ibs_op");
+        if (t < 0) {
+            seterr(err, errlen, "-e ibs: no ibs_op PMU here (AMD only; in a VM the host must pass IBS through)%s%s", "", "");
+            return -1;
+        }
+        attr->type = t; attr->config = 0;
+    } else {
+        seterr(err, errlen, "-e %s: unknown event (cpu-clock, cycles, ibs)%s", ev, "");
+        return -1;
+    }
+    return 0;
+}
+
+static int perf_open_cpu(int cpu, const struct perf_event_attr *attr)
+{
+    struct perf_event_attr a = *attr;
+    return syscall(SYS_perf_event_open, &a, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
 }
 
 static int on_record(void *ctx, void *data, size_t len)
@@ -143,6 +191,9 @@ struct hs_sampler *hs_sampler_attach(pid_t pid, const char *exe, const struct hs
     s->cb = cb; s->ctx = ctx;
     s->info.pid = pid;
     s->info.freq_hz = o->freq_hz ? o->freq_hz : 99;
+    struct perf_event_attr attr;
+    if (perf_attr_for(o->event, s->info.freq_hz, &attr, err, errlen)) { free(s); return NULL; }
+    snprintf(s->info.event, sizeof s->info.event, "%s", o->event ? o->event : "cpu-clock");
     s->info.max_depth = o->max_depth && o->max_depth <= HS_MAX_DEPTH ? o->max_depth : 512;
     if (exe) {
         snprintf(s->info.exe, sizeof s->info.exe, "%s", exe);
@@ -207,10 +258,13 @@ struct hs_sampler *hs_sampler_attach(pid_t pid, const char *exe, const struct hs
     s->links = calloc(ncpu, sizeof *s->links);
     s->nlinks = ncpu;
     for (int cpu = 0; cpu < ncpu; cpu++) {
-        int fd = perf_open_cpu(cpu, s->info.freq_hz);
+        int fd = perf_open_cpu(cpu, &attr);
         if (fd < 0) {
-            if (errno == ENODEV) continue;                    /* offline CPU */
-            seterr(err, errlen, "perf_event_open: %s (CAP_PERFMON / perf_event_paranoid?)%s", strerror(errno), "");
+            /* ENODEV is an offline CPU for cpu-clock, but for a hardware event
+             * it is also "this machine has no such counter" on every CPU */
+            if (errno == ENODEV && attr.type == PERF_TYPE_SOFTWARE) continue;
+            if (errno == ENODEV && cpu > 0 && s->info.cpus > 0) continue;
+            seterr(err, errlen, "perf_event_open (%s): %s (no such counter here, or CAP_PERFMON / perf_event_paranoid?)", s->info.event, strerror(errno));
             hs_sampler_close(s); return NULL;
         }
         s->links[cpu] = bpf_program__attach_perf_event(s->skel->progs.hsp_sample, fd);

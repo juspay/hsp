@@ -346,7 +346,7 @@ void usage() {
   std::fputs("usage: hsp agent (-p PID | --name COMM | --from-capture FILE --exe PATH) --collector URL\n"
              "                 [--service NAME] [--host NAME] [--interval SECS] [--spool DIR] [--label-mode none|full|tag]\n"
              "                 [--metrics-file PATH] [--max-batch-mb MB] [--spool-max-mb MB]\n"
-             "                 [-F hz] [-d depth] [-r ring_mb] [--no-label] [--no-alloc] [--no-thunk]\n", stderr);
+             "                 [-F hz] [-e cpu-clock|cycles|ibs] [-d depth] [-r ring_mb] [--no-label] [--no-alloc] [--no-thunk]\n", stderr);
 }
 
 }  // namespace
@@ -375,6 +375,7 @@ int cmd_agent(int argc, char** argv) {
     else if (f == "--spool-max-mb") a.spool_max_bytes = (uint64_t)atof(val()) * (1 << 20);
     else if (f == "-r") o.ring_mb = atoi(val());
     else if (f == "-F") o.freq_hz = atoi(val());
+    else if (f == "-e") o.event = val();
     else if (f == "-d") o.max_depth = atoi(val());
     else if (f == "--no-label") o.no_label = 1;
     else if (f == "--no-alloc") o.no_alloc = 1;
@@ -449,8 +450,8 @@ int cmd_agent(int argc, char** argv) {
   a.exe = a.info->exe; a.exe_size = a.info->exe_size; a.pid = pid;
   a.identify();
   if (a.service.empty()) a.service = a.exe.substr(a.exe.rfind('/') + 1);
-  std::fprintf(stderr, "hsp agent: pid %d, %s, GHC %d.%d, %u Hz x %d CPUs, every %.0f s -> %s (service %s)\n",
-               pid, a.info->exe, a.info->ghc_major, a.info->ghc_minor, a.info->freq_hz, a.info->cpus, interval,
+  std::fprintf(stderr, "hsp agent: pid %d, %s, GHC %d.%d, %u Hz %s x %d CPUs, every %.0f s -> %s (service %s)\n",
+               pid, a.info->exe, a.info->ghc_major, a.info->ghc_minor, a.info->freq_hz, a.info->event, a.info->cpus, interval,
                a.collector.c_str(), a.service.c_str());
   auto next = std::chrono::steady_clock::now() + std::chrono::duration<double>(interval);
   while (!stop_requested) {

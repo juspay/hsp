@@ -1,6 +1,6 @@
 /* hsp record: sample one GHC process into an HSPREC01 capture.
  *
- *   hsp record [-F hz] [-d depth] [-t secs] [-r ring_mb] [--no-label]
+ *   hsp record [-F hz] [-e event] [-d depth] [-t secs] [-r ring_mb] [--no-label]
  *              [--no-alloc] [--no-thunk] -o FILE (-p PID | -- program args...)
  *
  * The sampler itself is sampler.c; this writes its records to a file.
@@ -41,9 +41,11 @@ static int on_record(void *ctx, const struct hs_rec *r, size_t len)
 
 static void usage(void)
 {
-    fputs("usage: hsp record [-F hz] [-d depth] [-t secs] [-r ring_mb] [--no-label] [--no-alloc] [--no-thunk]\n"
+    fputs("usage: hsp record [-F hz] [-e event] [-d depth] [-t secs] [-r ring_mb] [--no-label] [--no-alloc] [--no-thunk]\n"
           "                  -o FILE (-p PID | -- program args...)\n"
           "  -F hz        sample frequency per CPU (default 99)\n"
+          "  -e event     what drives sampling: cpu-clock (default, works anywhere), cycles (needs a PMU),\n"
+          "               ibs (AMD Instruction-Based Sampling: exact leaf addresses; needs the ibs_op PMU)\n"
           "  -d depth     max frames per sample (default 512, cap 1024)\n"
           "  -t secs      stop after this long (default: until the target exits / SIGINT)\n"
           "  -r mb        ring buffer MiB, power of two (default 8)\n"
@@ -90,6 +92,7 @@ int cmd_record(int argc, char **argv)
         const char *a = argv[i];
         if (!strcmp(a, "--")) { cmd = argv + i + 1; break; }
         else if (!strcmp(a, "-F") && i + 1 < argc) o.freq_hz = atoi(argv[++i]);
+        else if (!strcmp(a, "-e") && i + 1 < argc) o.event = argv[++i];
         else if (!strcmp(a, "-d") && i + 1 < argc) o.max_depth = atoi(argv[++i]);
         else if (!strcmp(a, "-t") && i + 1 < argc) duration = atof(argv[++i]);
         else if (!strcmp(a, "-r") && i + 1 < argc) o.ring_mb = atoi(argv[++i]);
@@ -148,8 +151,8 @@ int cmd_record(int argc, char **argv)
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-    fprintf(stderr, "hsp record: pid %d, %s, GHC %d.%d, %u Hz x %d CPUs, depth %u, text %#lx-%#lx -> %s\n",
-            pid, in->exe, in->ghc_major, in->ghc_minor, in->freq_hz, in->cpus, in->max_depth,
+    fprintf(stderr, "hsp record: pid %d, %s, GHC %d.%d, %u Hz %s x %d CPUs, depth %u, text %#lx-%#lx -> %s\n",
+            pid, in->exe, in->ghc_major, in->ghc_minor, in->freq_hz, in->event, in->cpus, in->max_depth,
             (unsigned long)in->text_lo, (unsigned long)in->text_hi, out);
 
     int child_status = 0;

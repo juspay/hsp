@@ -17,6 +17,7 @@ struct hs_sampler_opts {
     unsigned max_depth;      /* 0 = 512 */
     unsigned ring_mb;        /* 0 = 8 */
     int no_label, no_alloc, no_thunk;
+    const char *event;       /* "cpu-clock" (NULL = this), "cycles", "ibs" */
 };
 
 struct hs_sampler_info {
@@ -27,6 +28,7 @@ struct hs_sampler_info {
     int ghc_major, ghc_minor;   /* 0 when not found */
     int cpus;                   /* perf events attached */
     unsigned freq_hz, max_depth;
+    char event[16];             /* the sampling event in use */
 };
 
 struct hs_sampler;
