@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ForeignFunctionInterface #-}
 -- | A GHC program with a known shape, for hsp's live tests.  Depends on base
 -- only.  Two modes:
 --
@@ -25,6 +26,17 @@
 -- so a test can compare what the sampler attributes to each label against
 -- what the thread itself counted.
 --
+-- @hsp-testprog ffi SECS@: time spent in C, which must still be billed to the
+-- green thread that called it.  Three regions of about SECS seconds each:
+--
+--   rid:unsafe   an unsafe foreign call into a busy C function that
+--                overwrites r13 and r12 (BaseReg and Hp), as optimised C does
+--   rid:safe     a safe foreign call into a busy C function, while a second
+--                thread (rid:other) runs Haskell code on the capability the
+--                call released
+--   rid:memset   an unsafe call to libc's memset over a large buffer: the
+--                leaf is in a shared library, outside the executable
+--
 -- Every thread is labelled with GHC.Conc.labelThread, so the sampler's label
 -- read is exercised.  Results are printed, so the optimiser cannot drop the
 -- work.
@@ -33,6 +45,10 @@ module Main (main) where
 import Control.Concurrent
 import Control.Monad
 import Data.IORef
+import Data.Word (Word8)
+import Foreign.C.Types
+import Foreign.Marshal.Alloc (free, mallocBytes)
+import Foreign.Ptr (Ptr)
 import GHC.Conc (labelThread)
 import System.Environment
 import System.IO
@@ -133,6 +149,46 @@ requests n = do
   t <- readIORef total
   putStrLn ("requests done " ++ show t)
 
+foreign import ccall unsafe "hsp_busy_unsafe" c_busy_unsafe :: CLong -> IO CLong
+foreign import ccall safe "hsp_busy_safe" c_busy_safe :: CLong -> IO CLong
+foreign import ccall unsafe "string.h memset" c_memset :: Ptr Word8 -> CInt -> CSize -> IO (Ptr Word8)
+
+-- | Run a labelled thread that repeats an action until told to stop.
+labelled :: String -> IORef Bool -> IO Int -> IO (MVar Int)
+labelled name stop act = do
+  done <- newEmptyMVar
+  _ <- forkIO $ do
+    me <- myThreadId
+    labelThread me ("rid:" ++ name)
+    let loop !acc = do
+          s <- readIORef stop
+          -- yield: a loop of foreign calls allocates nothing, so the timer
+          -- alone would never take the capability away from it
+          if s then putMVar done acc else act >>= \r -> yield >> loop (acc + r)
+    loop 0
+  pure done
+
+-- | One region: the named threads run together for about secs seconds.
+ffiRegion :: Double -> [(String, IO Int)] -> IO Int
+ffiRegion secs ts = do
+  stop <- newIORef False
+  dones <- mapM (\(n, a) -> labelled n stop a) ts
+  threadDelay (round (secs * 1e6))
+  writeIORef stop True
+  sum <$> mapM takeMVar dones
+
+ffi :: Double -> IO ()
+ffi secs = do
+  let n = 2000000 :: CLong        -- about a millisecond of C per call
+  a <- ffiRegion secs [("unsafe", fromIntegral <$> c_busy_unsafe n)]
+  b <- ffiRegion secs [ ("safe", fromIntegral <$> c_busy_safe n)
+                      , ("other", pure $! chatty 20000 1) ]
+  let size = 64 * 1024 * 1024
+  buf <- mallocBytes size
+  c <- ffiRegion secs [("memset", c_memset buf 1 (fromIntegral size) >> pure 1)]
+  free buf
+  putStrLn ("ffi done " ++ show (a + b + c))
+
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
@@ -140,5 +196,6 @@ main = do
   case args of
     ["requests", n] -> requests (read n)
     ["smoke", s] -> smoke (read s)
+    ["ffi", s] -> ffi (read s)
     [s] -> smoke (read s)
     _ -> smoke 3

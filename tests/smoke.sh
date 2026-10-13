@@ -4,6 +4,8 @@
 #
 #   tests/smoke/build.sh                        # once: program + map per GHC (no root)
 #   sudo tests/smoke.sh [ghc984|ghc98|ghc910|ghc928] [secs] [hz]
+#   HSP_SMOKE_NO_ROOT=1 HSP=/path/to/hsp tests/smoke.sh ...   # an hsp with
+#       cap_bpf,cap_perfmon,cap_sys_ptrace=ep (setcap) instead of root
 #
 # Part 1, `hsp-testprog smoke': what must hold, and why each line matters:
 #   labels     every walked sample carries rid:allocy|chatty|deep -- the
@@ -18,14 +20,26 @@
 # exact allocation; the bytes hsp attributes to each rid:req-<i> label must
 # track it (correlation >= 0.95, total within 30%: hsp misses what a thread
 # allocates before its first and after its last sample).
+# Part 3, `hsp-testprog ffi': CPU spent in C must be billed to the green
+# thread that called it:
+#   unsafe     a busy C function that overwrites r13/r12, under rid:unsafe --
+#              the thread is found through the RTS's Task, not r13
+#   safe       a busy C function in a safe call, under rid:safe and never
+#              under rid:other, the thread that runs on the capability the
+#              call released (r13 still points at that capability)
+#   memset     libc's memset under rid:memset, named `... [libc...]' -- a pc
+#              outside the executable is kept and named from the library
+#   alloc      none of these samples carries an allocation counter (Hp is
+#              not valid in C)
+#   GC         collector ticks (part 2) are under the (GC) root, not a request
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 HSP=${HSP:-$HERE/../build/hsp}
 V=${1:-ghc984} SECS=${2:-2} HZ=${3:-499}
 S=$HERE/smoke/build/$V
-[ "$(id -u)" = 0 ] || { echo "needs root: sudo $0 $*"; exit 1; }
+[ "$(id -u)" = 0 ] || [ -n "${HSP_SMOKE_NO_ROOT:-}" ] || { echo "needs root: sudo $0 $*"; exit 1; }
 [ -x "$S/hsp-testprog" ] && [ -f "$S/testprog.hsm" ] || { echo "run tests/smoke/build.sh $V first"; exit 1; }
-OUT=$S/live; rm -rf "$OUT"; mkdir -p "$OUT/smoke" "$OUT/requests"
+OUT=$S/live; rm -rf "$OUT"; mkdir -p "$OUT/smoke" "$OUT/requests" "$OUT/ffi"
 
 fail=0
 check() { if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; fail=1; fi; }
@@ -35,7 +49,7 @@ record_fold() {  # dir, program args...
   cat "$d/record.err"
   [ $rc = 0 ] || { echo "record exited $rc"; exit 1; }
   "$HSP" fold "$d/cap.bin" "$S/testprog.hsm" "$d" --no-lines > "$d/agg.txt"; frc=$?
-  grep -E '^samples in|status:|depth min|walk cost|green-thread|allocation \(' "$d/agg.txt"
+  grep -E '^samples |status:|depth min|walk cost|green-thread|thread identity|allocation \(' "$d/agg.txt"
 }
 
 echo "== $V: smoke ($SECS s per region, $HZ Hz)"
@@ -108,6 +122,39 @@ check $frc "fold exit $frc (resolution gate)"
 "$HSP" fold "$O/cap.bin" "$S/testprog.hsm" "$O/lines" > "$O/agg-lines.txt"; lrc=$?
 w=$(grep -cE 'Main\.(allocy|chatty|deep)\b' "$O/lines/collapsed.txt")
 check $(( lrc == 0 && w == 0 ? 0 : 1 )) "DWARF-line naming: $w stacks name a function requests never run (expected 0)"
+# 24 requests allocate gigabytes: the collector runs, and its ticks belong to no request
+if grep -q 'task_route=on' "$O/record.err"; then
+  g=$(grep '^(GC);' "$O/collapsed-labelled.txt" | awk '{s+=$NF} END{print s+0}')
+  gr=$(grep -E '^rid:.*;(evacuate|scavenge_block|GarbageCollect)[0-9]* [0-9]+$' "$O/collapsed-labelled.txt" | awk '{s+=$NF} END{print s+0}')
+  check $(( g > 0 ? 0 : 1 )) "GC: $g samples under the (GC) root (expected > 0)"
+  check $(( gr * 20 <= g ? 0 : 1 )) "GC: $gr collector samples under a request label (expected <= 5% of $g)"
+fi
 
+fi
+
+# C code needs the Task route (threaded RTS, validated at attach); 9.2 has no labels to check by
+if [ $LABELS = 1 ]; then
+echo "== $V: ffi ($SECS s per region)"
+O=$OUT/ffi; record_fold "$O" ffi "$SECS"
+check $(grep -q 'task_route=on' "$O/record.err"; echo $?) "the Task route validated on this RTS (task_route=on)"
+L=$O/collapsed-labelled.txt
+want=$(( SECS * HZ / 2 ))
+leaf() { grep -E "^$1;(.*;)?$2 [0-9]+\$" "$L" | awk '{s+=$NF} END{print s+0}'; }
+u=$(leaf rid:unsafe hsp_busy_unsafe); ux=$(grep -E ';hsp_busy_unsafe [0-9]+$' "$L" | grep -v '^rid:unsafe;' | awk '{s+=$NF} END{print s+0}')
+check $(( u >= want ? 0 : 1 )) "unsafe call: $u samples of hsp_busy_unsafe under rid:unsafe (expected >= $want)"
+check $(( ux * 10 <= u ? 0 : 1 )) "unsafe call: $ux samples of hsp_busy_unsafe elsewhere (expected <= 10% of $u: the ticks before the Task route is validated)"
+sf=$(leaf rid:safe hsp_busy_safe); so=$(leaf rid:other hsp_busy_safe)
+check $(( sf >= want ? 0 : 1 )) "safe call: $sf samples of hsp_busy_safe under rid:safe (expected >= $want)"
+check $(( so == 0 ? 0 : 1 )) "safe call: $so samples of hsp_busy_safe under rid:other, the thread on the released capability (expected 0)"
+ot=$(grep -E '^rid:other;.*Main\.' "$L" | awk '{s+=$NF} END{print s+0}')
+check $(( ot > 0 ? 0 : 1 )) "safe call: rid:other ran Haskell code meanwhile ($ot samples)"
+ms=$(grep -E '^rid:memset;(.*;)?[^;]*memset[^;]* \[libc[^];]*\] [0-9]+$' "$L" | awk '{s+=$NF} END{print s+0}')
+check $(( ms >= want ? 0 : 1 )) "shared library: $ms samples of libc's memset under rid:memset (expected >= $want)"
+un=$(grep -oE 'in no mapping [0-9]+' "$O/agg.txt" | grep -oE '[0-9]+$')
+check $(( ${un:-1} == 0 ? 0 : 1 )) "shared library: ${un:-?} leaves outside the executable in no mapping (expected 0)"
+# the C regions allocate nothing in Haskell; a bogus Hp would show as bytes here
+ab=$(grep -E '^rid:(unsafe|safe|memset);' "$O/collapsed-alloc-labelled.txt" 2>/dev/null | grep -E 'hsp_busy|memset' | awk '{s+=$NF} END{print s+0}')
+check $(( ab == 0 ? 0 : 1 )) "alloc: $ab bytes attributed to C leaves (expected 0)"
+check $frc "fold exit $frc (resolution gate)"
 fi
 [ $fail = 0 ] && echo "SMOKE OK ($V)" || { echo "SMOKE FAILED ($V: $OUT)"; exit 1; }
