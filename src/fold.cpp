@@ -168,7 +168,7 @@ int audit(const Map& m, const std::vector<Sample>& samples, const Names& N, doub
 
 int cmd_fold(int argc, char** argv) {
   if (argc < 3) {
-    std::fprintf(stderr, "usage: hsp fold CAPTURE MAP.hsm OUTDIR [--max-unresolved PCT] [--no-lines]\n");
+    std::fprintf(stderr, "usage: hsp fold CAPTURE MAP.hsm OUTDIR [--max-unresolved PCT] [--no-lines] [--kernel-frame]\n");
     return 2;
   }
   const char* path = argv[0];
@@ -178,10 +178,13 @@ int cmd_fold(int argc, char** argv) {
   std::filesystem::create_directories(outdir, ec);
   if (ec) { std::fprintf(stderr, "hsp fold: cannot create %s: %s\n", outdir.c_str(), ec.message().c_str()); return 2; }
   double max_unresolved = 1.0;
-  bool lines = true;
+  bool lines = true, kernel_frame = false;
   for (int i = 3; i < argc; i++) {
     if (!std::strcmp(argv[i], "--max-unresolved") && i + 1 < argc) max_unresolved = std::atof(argv[++i]);
     else if (!std::strcmp(argv[i], "--no-lines")) lines = false;
+    // a tick taken inside a system call gets a [kernel] frame under the
+    // function that made the call (default: counted as that function's own)
+    else if (!std::strcmp(argv[i], "--kernel-frame")) kernel_frame = true;
   }
   Map m = Map::open(argv[1]);
   m.use_lines(lines);
@@ -336,7 +339,9 @@ int cmd_fold(int argc, char** argv) {
     } else {
       o = "[c];";
     }
-    return o + N.s[s.leaf];
+    o += N.s[s.leaf];
+    if (kernel_frame && (s.flags & HS_F_IN_KERNEL)) o += ";[kernel]";
+    return o;
   };
   Counter<std::string> folded;
   for (auto& s : samples) if (s.status == "stop") folded.add(body(s));
