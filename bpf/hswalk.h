@@ -121,15 +121,10 @@ static __always_inline void hswalk_stop(struct hswalk *w, hs_u8 status)
     w->done = 1;
 }
 
-/* Begin a walk at `sp' inside `stackobj': -1 with no frames if sp is not
- * inside that chunk (NOFRAME), else 0 with sp advanced past the running
- * procedure's slots to the first return frame (or the walk already stopped
- * BADFRAME when none is found within HS_MAX_SCAN words). */
-static __always_inline int hswalk_begin(struct hswalk *w, hs_u64 stackobj, hs_u64 sp)
+/* Point the walker at `sp' inside `stackobj': -1 if sp is not inside that
+ * chunk (NOFRAME: these registers are not this thread's), else 0.  One read. */
+static __always_inline int hswalk_enter(struct hswalk *w, hs_u64 stackobj, hs_u64 sp)
 {
-    hs_u64 info;
-    struct hs_itbl t;
-    hs_u32 i;
     HS_N(w) = 0;
     w->hops = 0;
     w->scanned = 0;
@@ -140,15 +135,36 @@ static __always_inline int hswalk_begin(struct hswalk *w, hs_u64 stackobj, hs_u6
     if ((sp & 7) || sp < w->lo || sp >= w->hi)
         return -1;
     w->sp = sp;
+    return 0;
+}
+
+/* After hswalk_enter: advance sp past the running procedure's slots to the
+ * first return frame; the walk is already stopped BADFRAME when none is
+ * found within HS_MAX_SCAN words. */
+static __always_inline void hswalk_scan(struct hswalk *w)
+{
+    hs_u64 info;
+    struct hs_itbl t;
+    hs_u32 i;
     for (i = 0; i < HS_MAX_SCAN; i++) {
         if (w->sp + 8 > w->hi)
             break;
         if (hs_frame_at(w, w->sp, &info, &t))
-            return 0;
+            return;
         w->sp += 8;
         w->scanned++;
     }
     hswalk_stop(w, HS_STATUS_BADFRAME);
+}
+
+/* Begin a walk at `sp' inside `stackobj': -1 with no frames if sp is not
+ * inside that chunk (NOFRAME), else 0 with sp at the first return frame (or
+ * the walk already stopped BADFRAME). */
+static __always_inline int hswalk_begin(struct hswalk *w, hs_u64 stackobj, hs_u64 sp)
+{
+    if (hswalk_enter(w, stackobj, sp))
+        return -1;
+    hswalk_scan(w);
     return 0;
 }
 
