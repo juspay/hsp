@@ -12,6 +12,12 @@
 // collector is unreachable the batch goes to the spool dir and is retried
 // on later intervals; without a spool it is dropped and counted.
 //
+// A tick in C code (a foreign call, the RTS) is billed to the green thread
+// that is making the call, found through the RTS's Task (bpf/hsp.bpf.c); a
+// tick in the collector gets the label "(GC)".  A pc outside the executable
+// (a shared library) is not sampled: its name would need the target's
+// mappings, which a batch does not carry.
+//
 // The allocation counter is per green thread: the drop between two samples
 // of the same thread is the bytes it allocated in between, attributed to
 // the later sample's stack (as fold does).  The last counter of every
@@ -105,7 +111,10 @@ struct Agent {
   }
 
   std::string label_of(const RawSample& s) {
-    if (label_mode == "none" || s.label.empty() || s.label == "-") return "";
+    if (label_mode == "none") return "";
+    // garbage collection belongs to no thread: a root of its own, as in fold
+    if (!s.has_hid && (s.flags & HS_F_GC)) return "(GC)";
+    if (s.label.empty() || s.label == "-") return "";
     if (label_mode == "tag") {                        // "rid:<id> TAG" -> "TAG"
       auto sp = s.label.find(' ');
       return sp == s.label.npos ? "" : s.label.substr(sp + 1);
@@ -321,6 +330,7 @@ void rec_to_raw(const hs_rec* r, RawSample& s) {
   s.frames.resize(r->depth); s.updatees.resize(r->depth);
   for (unsigned i = 0; i < r->depth; i++) { s.frames[i] = r->frames[2 * i]; s.updatees[i] = r->frames[2 * i + 1]; }
   s.has_hid = r->flags & HS_F_TSO;
+  s.flags = r->flags;
   if (s.has_hid) {
     s.hid = std::to_string(r->tso_id);
     s.label = (r->flags & HS_F_LABEL) ? std::string(r->label, std::min<size_t>(r->label_len, HS_LABEL_MAX)) : "-";
@@ -405,10 +415,14 @@ int cmd_agent(int argc, char** argv) {
     a.identify();
     if (a.service.empty()) a.service = a.exe.substr(a.exe.rfind('/') + 1);
     uint64_t first = 0;
+    CaptureInfo cinfo;
     read_capture(capture.c_str(), [&](RawSample& s) {
+      // as when sampling live: a pc outside the executable needs the target's
+      // mappings to be named, and a batch does not carry them
+      if (cinfo.outside_text(s.pc)) return;
       if (s.has_ts) { if (!first) first = s.ts; s.ts = (long long)(a.now_real() - a.mono_to_real) - (long long)(1000000000ull * 60) + (s.ts - (long long)first); }
       a.add(s);
-    });
+    }, &cinfo);
     a.flush();
     curl_global_cleanup();
     return a.sent ? 0 : 1;
