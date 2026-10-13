@@ -43,7 +43,7 @@ let
         ++ a.extraArgs);
       # CAP_BPF: the program and its maps.  CAP_PERFMON: perf_event_open on every
       # CPU and attaching to it.  CAP_SYS_PTRACE: /proc/PID/{exe,maps} of another
-      # user's process.  Nothing else; no root.
+      # user's process, and reading its memory to check the RTS's Task layout.  Nothing else; no root.
       AmbientCapabilities = [ "CAP_BPF" "CAP_PERFMON" "CAP_SYS_PTRACE" ];
       CapabilityBoundingSet = [ "CAP_BPF" "CAP_PERFMON" "CAP_SYS_PTRACE" ];
       ReadWritePaths = [ "/var/spool/hsp" ] ++ lib.optional (cfg.metricsDir != null) cfg.metricsDir;

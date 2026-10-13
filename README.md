@@ -85,6 +85,22 @@ into speedscope.app, inferno-flamegraph or Pyroscope. `agg.txt` has the top
 functions (inclusive/self), the walk statistics and a resolution audit that
 ends in a PASS/FAIL gate (exit 3 on FAIL).
 
+In the labelled files every sample has a root: the green thread's label,
+`(unlabelled thread)`, `(GC)` for the collector, or `(no Haskell thread: C
+code)`. CPU spent in C on behalf of a thread (a foreign call, the RTS
+allocating for it, `memcpy`) is under that thread's label; see
+[C code, the RTS and garbage collection](#c-code-the-rts-and-garbage-collection).
+`agg.txt` says how each sample's thread was found:
+
+```
+samples outside the executable: 5617   named by library symbol 4941   by library only 676   in no mapping 0
+thread identity: r13 50327 (84.6%)   via Task 7193 (12.1%: on its capability 6558, safe foreign call 635)   GC 749 (1.3%)   no thread 1185 (2.0%)
+```
+
+`--kernel-frame` puts a `[kernel]` frame under the function that made a
+system call for ticks taken inside it (by default they count as that
+function's own).
+
 ## What you need from the target binary
 
 Nothing at runtime: the sampler reads the RTS's own structures
@@ -96,6 +112,12 @@ Nothing at runtime: the sampler reads the RTS's own structures
 | plain `-O2`, unstripped | exported and top-level functions exact; local bindings (`go`, `sat_…`, workers) named by the nearest preceding symbol, so `fold`'s `guess%` is high and the module is right far more often than the function |
 | `-O2` + the flags below | every local binding and stack frame by its real name and source span; DWARF fixes the leaves |
 | stripped | nothing: `hsp record` refuses it (no `stg_TSO_info`) |
+
+Billing C code to the thread that called it additionally needs the threaded
+RTS (`-threaded`) linked into the executable and its `my_task`, `all_tasks`,
+`capabilities` and `n_capabilities` symbols (any unstripped binary has
+them); without them `hsp record` says so in one line and samples as it did
+before that existed.
 
 ### Build flags
 
@@ -215,7 +237,8 @@ Grafana however you run them and point `hsp collect --pyroscope` at it.
 
 `bpf/hsp.bpf.c` runs on a cpu-clock perf event on every CPU. For a tick in
 the target process it reads ip/bp/r13/r12; checks that r13 + rCurrentTSO
-names an object whose header is `stg_TSO_info` (a live Haskell thread); reads
+names an object whose header is `stg_TSO_info` (a live Haskell thread) and
+that rbp lies in its stack (else it is C code: next section); reads
 the thread's id, label and allocation counter; walks the STG stack from rbp
 (`bpf/hswalk.h`: scan up to 64 words above Sp for the first return frame,
 then frame by frame to STOP_FRAME, validating each, two kernel reads per
@@ -232,6 +255,84 @@ accounting at r = 0.98, allocation at r = 0.998.
 Overhead levers, in order of effect: `-F` (samples per second per CPU), `-d`
 (max frames, default 512), `--no-thunk` (skips naming update frames' thunks
 by their creator: two reads per update frame), `--no-label` / `--no-alloc`.
+
+## C code, the RTS and garbage collection
+
+A tick in Haskell code knows its thread from the registers. A tick in C does
+not: C reuses `r13` and `rbp`, and a `pc` in a shared library is not in the
+executable at all. hsp handles the three cases separately.
+
+**A foreign call, or the RTS working for a thread.** The threaded RTS keeps a
+`Task` per OS thread in thread-local storage (`my_task`). When `r13`/`rbp`
+are not a mutator's, the BPF program reads it through the thread's fs base:
+
+- the OS thread holds a capability (`task->cap->running_task == task`) that
+  is inside `StgRun` (`cap->in_haskell`): the thread is `cap->r.rCurrentTSO`.
+  This is an *unsafe* foreign call, or RTS code called from Haskell
+  (`allocate`, `threadPaused`, the STM);
+- otherwise `task->incall->suspended_tso`: the thread whose *safe* foreign
+  call this OS thread is making.
+
+The scheduler clears `rCurrentTSO` and `in_haskell` when a thread stops
+running and `resumeThread` clears `suspended_tso`, so neither is ever a
+thread that ran earlier. Such samples are flagged in the capture (`via
+Task` in fold's summary) and appear under the thread's label. Their stack:
+for a safe call the Haskell stack is walked from the Sp the caller saved in
+the TSO; for an unsafe call Sp is still in `rbp` only if the C code has not
+used that register, and then the stack is walked as usual; otherwise the
+leaf stands alone under the label, as `label;[c];leaf`. They never carry an
+allocation counter (Hp, `r12`, is not valid in C), so allocation
+attribution is not affected by what C leaves in that register.
+
+During a safe call `r13` can still point at the capability the OS thread
+gave up, on which another OS thread is by then running a different green
+thread. A TSO found through `r13` is therefore only believed when `rbp` lies
+in its stack; otherwise the Task decides.
+
+**Garbage collection** is not billed to a thread. Whichever request
+happened to fill the nursery did not cause the collection alone, and with
+`-N` the work is spread over OS threads that were running other requests.
+A tick on an OS thread that holds a capability, runs no Haskell thread and
+has the collector's `gc_thread` in `r13` (where the GC keeps it) gets the
+root `(GC)`; `hsp agent` sends it with the label `(GC)`. Collector code that
+borrows `r13` for something else (parts of the block allocator, libc called
+from the GC) is not recognised and stays in the bucket below. `allocate`
+called for a thread from Haskell code is that thread's.
+
+**`(no Haskell thread: C code)`** is what remains: the scheduler between
+threads, idle workers, the timer, OS threads the RTS does not know, and all
+C code when the Task route is off.
+
+**Shared libraries.** `hsp record` keeps ticks whose `pc` is outside the
+executable (`--text-only` drops them, as earlier versions did) and stores
+the target's executable mappings in the capture header, at the start and
+again while it runs. `hsp fold` names such a leaf from the mapped file's own
+`.symtab` (or `.dynsym`): `__memmove_avx_unaligned_erms [libc.so.6]`;
+`[libc.so.6]` when the file is not readable where fold runs or has no symbol
+covering the address; `[vdso]`; `?0x…` for an address in no mapping. Fold
+reads the library at the path the target had it mapped from: run it on the
+same host, or one with the same files. `hsp agent` does not send these ticks
+(a batch does not carry the mappings); everything above about threads holds
+for it.
+
+**The layout is checked, not assumed.** `Task`, `InCall` and `Capability`
+are RTS-internal and not in `DerivedConstants.h`. The offsets are those of
+the 9.2.8, 9.8.4 and 9.10.3 sources (threaded, x86-64 glibc; identical in
+the three). Before using them, and every second while sampling, the loader
+follows the same chain through the live process for every Task on the RTS's
+`all_tasks` list: the thread-local slot of the Task's OS thread holds that
+Task; `capabilities[task->cap->no]` is `task->cap`; `task->incall->task` is
+the Task; `suspended_tso` is null or a TSO and set exactly when
+`suspended_cap` is; `running_task` is null or a Task; `in_haskell` is set
+exactly when `rCurrentTSO` is a TSO; `gc_threads[n]->cap` is capability n.
+If that does not hold (another RTS layout, a non-threaded RTS, no read
+access to the target's memory) the route stays off, with one line on stderr
+and `task_route=off` and a `no_task_route` count in record's summary, and
+hsp samples as it did without it: C code under `(no Haskell thread: C
+code)`, never under a wrong thread. `--no-task` turns it off by hand.
+
+Reading the target needs `CAP_SYS_PTRACE` (or root), which the agent's unit
+already has.
 
 ## Building the map (`hsp symmap`)
 
@@ -290,10 +391,15 @@ Three layers, all from `nix flake check`:
 - `sudo tests/smoke.sh [ghc984|ghc98|ghc910|ghc928] [secs] [hz]` on a host:
   the same record/fold checks against a real kernel and CPU (labels, deep
   stacks across chunks, allocation attribution per request, walk cost,
-  the resolution gate, and that DWARF-line naming never names code a run
-  did not execute). `tests/smoke/build.sh` builds the program and its map
-  per GHC first. `HSP_SMOKE_COST_NS` raises the walk-cost bound (a VM is
-  slower).
+  the resolution gate, that DWARF-line naming never names code a run
+  did not execute, and C code: a busy C function called unsafe and one
+  called safe each under its caller's label, the safe one never under the
+  thread that took over the capability, libc's `memset` named and under its
+  caller, collector ticks under `(GC)`). `tests/smoke/build.sh` builds the
+  program and its map per GHC first. `HSP_SMOKE_COST_NS` raises the
+  walk-cost bound (a VM is slower). Without root:
+  `HSP_SMOKE_NO_ROOT=1 HSP=/path/to/hsp tests/smoke.sh` with an hsp that has
+  the three capabilities (`setcap cap_bpf,cap_perfmon,cap_sys_ptrace=ep`).
 ## Layout
 
 | | |
@@ -302,7 +408,7 @@ Three layers, all from `nix flake check`:
 | `src/sampler.{h,c}` | the sampler as a library (attach, poll, stats) |
 | `src/record.c`, `src/agent.cpp`, `src/collect.cpp` | one-off capture; continuous agent; collector |
 | `src/symmap.cpp`, `src/hsm_write.*`, `src/zdecode.h` | building the map |
-| `src/hsm.*`, `src/naming.h`, `src/fold.cpp`, `src/dump.cpp` | reading the map; naming; the report |
+| `src/hsm.*`, `src/naming.h`, `src/libsym.h`, `src/fold.cpp`, `src/dump.cpp` | reading the map; naming (and shared-library leaves); the report |
 | `src/capture.*`, `src/wire.h` | file formats: captures, agent -> collector batches |
 | `stack/`, `dist/` | the UI stack module; systemd units, capabilities, install notes |
 | `tests/` | the walker, version-scan and IPE tests, the test program, the live smoke test |

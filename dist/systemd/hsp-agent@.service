@@ -25,7 +25,8 @@ RestartSec=5
 
 # CAP_BPF: load the program and its maps.  CAP_PERFMON: perf_event_open on
 # every CPU and attaching a perf_event BPF program.  CAP_SYS_PTRACE: read
-# /proc/PID/maps and /proc/PID/exe of another user's process.
+# /proc/PID/maps and /proc/PID/exe of another user's process, and its memory
+# (the RTS's Task layout is checked on the live process before it is used).
 AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE
 CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE
 NoNewPrivileges=true
