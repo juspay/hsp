@@ -15,7 +15,9 @@
 #include <vector>
 
 #include "capture.h"
+#include "hsp_abi.h"
 #include "hsm.h"
+#include "libsym.h"
 #include "naming.h"
 #include "pyfmt.h"
 
@@ -42,6 +44,8 @@ struct Sample {
   uint64_t pc;
   std::vector<uint64_t> frames_raw;
   bool has_hid = false;
+  uint8_t flags = 0;               // HS_F_*: how the thread was found (0 from a text capture)
+  bool outside = false;            // pc outside the executable: named from the mapped library
   std::string hid, label;          // label "" = None
   bool has_ts = false, has_acnt = false;
   long long ts = 0, acnt = 0, alloc = 0;
@@ -81,10 +85,13 @@ int audit(const Map& m, const std::vector<Sample>& samples, const Names& N, doub
     if (!exact_rollup(r)) heur.add(name(m, h, "?"));
   };
   for (const Sample& s : samples) {
-    Hit e = m.resolve_addr(s.pc);
-    leaf.add(klass(e));
-    if (!e) unres.add({0, s.pc});
-    else count_roll(e);
+    // a leaf outside the executable is not the map's to resolve
+    if (!s.outside) {
+      Hit e = m.resolve_addr(s.pc);
+      leaf.add(klass(e));
+      if (!e) unres.add({0, s.pc});
+      else count_roll(e);
+    }
     for (uint64_t fr : s.frames_raw) {
       const Entry* ie = m.resolve_info(fr);
       Hit a = ie ? Hit{} : m.resolve_addr(fr);
@@ -208,17 +215,34 @@ int cmd_fold(int argc, char** argv) {
   };
 
   std::vector<Sample> samples;
+  CaptureInfo info;
+  std::optional<libsym::Resolver> libs;
+  Counter<std::string> outside;
   read_capture(path, [&](RawSample& rs) {
       Sample s;
       s.pc = rs.pc;
+      s.flags = rs.flags;
+      s.outside = info.outside_text(s.pc);
       s.depth = rs.depth; s.hops = rs.hops; s.scanned = rs.scanned; s.cost = rs.cost;
       s.frames_raw = std::move(rs.frames);
       s.has_hid = rs.has_hid; s.hid = rs.hid; s.label = rs.label;
       s.has_ts = rs.has_ts; s.ts = rs.ts; s.has_acnt = rs.has_acnt; s.acnt = rs.acnt;
       const std::vector<uint64_t>& uis = rs.updatees;
-      Hit e = m.resolve_leaf(s.pc);
+      Hit e = s.outside ? Hit{} : m.resolve_leaf(s.pc);
       s.sym = e ? std::string(e.e->symbol ? m.str(e.e->symbol) : m.str(e.e->name)) : "";
-      s.leaf = N.id(name(m, e, owner_or(m, s.pc, false)));
+      if (s.outside) {
+        // a shared library, the vdso: `symbol [lib]', `[lib]', or the bare address
+        if (!libs) {
+          std::vector<libsym::Mapping> mm;
+          for (auto& x : info.maps) mm.push_back({x.start, x.end, x.offset, x.path});
+          libs.emplace(std::move(mm));
+        }
+        auto [ln, kind] = libs->name(s.pc);
+        outside.add(kind == libsym::Resolver::SYMBOL ? "symbol" : kind == libsym::Resolver::LIBRARY ? "library" : "unmapped");
+        s.leaf = N.id(ln.empty() ? "?0x" + pyfmt::hex(s.pc).substr(2) : ln);
+      } else {
+        s.leaf = N.id(name(m, e, owner_or(m, s.pc, false)));
+      }
       s.haskell = haskell_mode(s.sym);
       s.status = rs.status >= 1 && rs.status <= 5 ? STATUS[rs.status] : std::to_string(rs.status);
       // zip(frames, uis): the shorter one decides
@@ -236,7 +260,7 @@ int cmd_fold(int argc, char** argv) {
       s.leaf_dwarf = !e ? nullptr : e.match == Hit::DWARF_LINE ? "rescued" : e.site ? "site" : e.dwarf ? "confirmed" : nullptr;
       s.leaf_site = e && e.site ? N.id(std::string(m.str(e.site))) + 1 : 0;
       samples.push_back(std::move(s));
-  });
+  }, &info);
   if (samples.empty()) { std::printf("no samples\n"); return 1; }
 
   if (!thunk_stat.empty()) {
@@ -249,8 +273,26 @@ int cmd_fold(int argc, char** argv) {
     std::printf("thunk creators (hswalk_thunk.bt): update frames %s\n", o.c_str());
   }
   std::vector<const Sample*> h, c;
-  for (auto& s : samples) (s.haskell ? h : c).push_back(&s);
-  std::printf("samples in .text: %zu   haskell-mode %zu   c-mode %zu\n", samples.size(), h.size(), c.size());
+  for (auto& s : samples) if (!s.outside) (s.haskell ? h : c).push_back(&s);
+  std::printf("samples in .text: %zu   haskell-mode %zu   c-mode %zu\n", h.size() + c.size(), h.size(), c.size());
+  if (outside.total())
+    std::printf("samples outside the executable: %lld   named by library symbol %lld   by library only %lld   in no mapping %lld\n",
+                outside.total(), outside.get("symbol"), outside.get("library"), outside.get("unmapped"));
+  if (info.binary) {
+    // how each sample's green thread was found (HS_F_* in hsp_abi.h)
+    long long r13 = 0, unsafe_ = 0, safe = 0, gc = 0, none = 0;
+    for (auto& s : samples) {
+      if (s.flags & HS_F_SAFE) safe++;
+      else if (s.flags & HS_F_TASK) unsafe_++;
+      else if (s.flags & HS_F_TSO) r13++;
+      else if (s.flags & HS_F_GC) gc++;
+      else none++;
+    }
+    double n = samples.size();
+    std::printf("thread identity: r13 %lld (%.1f%%)   via Task %lld (%.1f%%: on its capability %lld, safe foreign call %lld)   "
+                "GC %lld (%.1f%%)   no thread %lld (%.1f%%)\n",
+                r13, 100.0 * r13 / n, unsafe_ + safe, 100.0 * (unsafe_ + safe) / n, unsafe_, safe, gc, 100.0 * gc / n, none, 100.0 * none / n);
+  }
   for (auto [label, group] : {std::pair{"haskell-mode", &h}, std::pair{"c-mode", &c}}) {
     if (group->empty()) continue;
     Counter<std::string> st;
@@ -332,8 +374,11 @@ int cmd_fold(int argc, char** argv) {
   // allocation: per green thread in time order, the drop of its allocation
   // counter between two samples is the bytes it allocated in between
   bool any_acnt = std::any_of(samples.begin(), samples.end(), [](auto& s) { return s.has_acnt; });
+  // Garbage collection is the program's cost, not the work of the thread
+  // that happened to trigger it: it gets a root of its own.
   auto root_of = [&](const Sample& s) -> std::string {
-    return !s.label.empty() && s.label != "-" ? s.label : s.has_hid ? "(unlabelled thread)" : "(no Haskell thread: C code)";
+    return !s.label.empty() && s.label != "-" ? s.label : s.has_hid ? "(unlabelled thread)"
+         : (s.flags & HS_F_GC) ? "(GC)" : "(no Haskell thread: C code)";
   };
   if (any_acnt) {
     std::vector<std::pair<std::string, std::vector<Sample*>>> byhid;
@@ -383,7 +428,7 @@ int cmd_fold(int argc, char** argv) {
     for (auto& s : samples) lab.add(root_of(s) + ";" + body(s));
     for (auto& s : samples)
       kinds.add(s.label.starts_with("rid:") ? "rid" : !s.label.empty() && s.label != "-" ? "other label"
-                : s.has_hid ? "unlabelled" : "no thread (C)");
+                : s.has_hid ? "unlabelled" : (s.flags & HS_F_GC) ? "GC" : "no thread (C)");
     std::string o;
     for (auto& [k, v] : kinds.most_common()) {
       if (!o.empty()) o += ", ";

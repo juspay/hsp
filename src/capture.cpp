@@ -82,11 +82,31 @@ void read_text(std::ifstream& in, const std::function<void(RawSample&)>& cb) {
 }
 
 // hsp record: the file header, then hs_rec records with 2*depth trailing words
-void read_binary(std::ifstream& in, const char* path, const std::function<void(RawSample&)>& cb) {
+void read_binary(std::ifstream& in, const char* path, const std::function<void(RawSample&)>& cb, CaptureInfo* info) {
   hs_file_hdr fh;
   in.read(reinterpret_cast<char*>(&fh), sizeof fh);
   if (!in || fh.version != 1 || fh.hdr_size < sizeof fh)
     throw std::runtime_error(std::string(path) + ": unsupported HSPREC header");
+  if (info) {
+    info->binary = true;
+    info->pid = fh.pid; info->freq_hz = fh.freq_hz;
+    info->text_lo = fh.text_lo; info->text_hi = fh.text_hi;
+    // the mappings sit between the fixed header and the first record
+    if (fh.n_maps && fh.maps_bytes <= fh.hdr_size - sizeof fh) {
+      std::vector<char> mb(fh.maps_bytes);
+      in.read(mb.data(), mb.size());
+      size_t off = 0;
+      for (uint32_t i = 0; in && i < fh.n_maps && off + sizeof(hs_file_map) <= mb.size(); i++) {
+        hs_file_map e;
+        std::memcpy(&e, mb.data() + off, sizeof e);
+        off += sizeof e;
+        if (e.path_len > mb.size() - off) break;
+        info->maps.push_back({e.start, e.end, e.offset, std::string(mb.data() + off, e.path_len)});
+        off += (e.path_len + 7) & ~size_t(7);
+      }
+      in.clear();
+    }
+  }
   in.seekg(fh.hdr_size);
   std::vector<char> buf(sizeof(hs_rec));
   for (size_t n = 0;; n++) {
@@ -107,6 +127,7 @@ void read_binary(std::ifstream& in, const char* path, const std::function<void(R
     s.status = r->status; s.depth = r->depth; s.hops = r->hops; s.scanned = r->scanned; s.cost = r->cost_ns;
     s.frames.resize(r->depth); s.updatees.resize(r->depth);
     for (unsigned i = 0; i < r->depth; i++) { s.frames[i] = r->frames[2 * i]; s.updatees[i] = r->frames[2 * i + 1]; }
+    s.flags = r->flags;
     if (r->flags & HS_F_TSO) {
       s.has_hid = true;
       s.hid = std::to_string(r->tso_id);
@@ -120,13 +141,13 @@ void read_binary(std::ifstream& in, const char* path, const std::function<void(R
 
 }  // namespace
 
-void read_capture(const char* path, const std::function<void(RawSample&)>& cb) {
+void read_capture(const char* path, const std::function<void(RawSample&)>& cb, CaptureInfo* info) {
   std::ifstream in(path, std::ios::binary);
   if (!in) throw std::runtime_error(std::string(path) + ": cannot open");
   char magic[8] = {};
   in.read(magic, 8);
   in.clear();
   in.seekg(0);
-  if (std::memcmp(magic, HS_FILE_MAGIC, 8) == 0) read_binary(in, path, cb);
+  if (std::memcmp(magic, HS_FILE_MAGIC, 8) == 0) read_binary(in, path, cb, info);
   else read_text(in, cb);
 }
