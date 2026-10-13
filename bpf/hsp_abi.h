@@ -36,6 +36,23 @@ typedef int hs_s32;
 #define HS_DEF_OFF_TSO_LABEL          88    /* 8 + OFFSET_StgTSO_label            */
 #define HS_DEF_OFF_TSO_ALLOC_LIMIT    112   /* 8 + OFFSET_StgTSO_alloc_limit      */
 
+/* The Task route (see hs_task_cfg): fields of rts/Task.h and rts/Capability.h,
+ * which DerivedConstants.h does not list.  These are GHC 9.2.8, 9.8.4 and
+ * 9.10.3, threaded RTS, x86-64 glibc (computed with offsetof against each
+ * source tree); the loader proves them on the live process before use. */
+#define HS_DEF_OFF_TASK_ID            0     /* Task.id: the pthread_t, = fs base   */
+#define HS_DEF_OFF_TASK_CAP           120   /* Task.cap                            */
+#define HS_DEF_OFF_TASK_INCALL        128   /* Task.incall                         */
+#define HS_DEF_OFF_TASK_ALL_NEXT      168   /* Task.all_next                       */
+#define HS_DEF_OFF_INCALL_SUSP_TSO    8     /* InCall.suspended_tso                */
+#define HS_DEF_OFF_INCALL_SUSP_CAP    16    /* InCall.suspended_cap                */
+#define HS_DEF_OFF_INCALL_TASK        40    /* InCall.task                         */
+#define HS_DEF_OFF_CAP_R              24    /* OFFSET_Capability_r                 */
+#define HS_DEF_OFF_CAP_NO             944   /* Capability.no                       */
+#define HS_DEF_OFF_CAP_RUNNING_TASK   952   /* Capability.running_task             */
+#define HS_DEF_OFF_CAP_IN_HASKELL     960   /* Capability.in_haskell (a bool)      */
+#define HS_OFF_GCTHREAD_CAP           0     /* gc_thread.cap                       */
+
 /* StgStack: header, then stack_size (u32, words) at +8, sp at +16, stack[] at +24 */
 #define HS_OFF_STACK_SIZE             8
 #define HS_OFF_STACK_SP               16
@@ -89,10 +106,23 @@ typedef int hs_s32;
 #define HS_F_TSO                      0x02  /* r13 named a live TSO: tso_id valid  */
 #define HS_F_ALLOC                    0x04  /* alloc is valid (Hp inside nursery)  */
 #define HS_F_LABEL                    0x08  /* label_len bytes of label present    */
+/* How the thread was found when r13 and rbp were not a mutator's (the pc is
+ * in C: a foreign call, the RTS).  Set together with HS_F_TSO, so a reader
+ * that knows nothing of them still gets the thread. */
+#define HS_F_TASK                     0x10  /* through the OS thread's Task        */
+#define HS_F_SAFE                     0x20  /* ... its suspended (safe) foreign call */
+/* No thread: the OS thread holds a capability and is collecting garbage. */
+#define HS_F_GC                       0x40
 
 /* -- Capture file ------------------------------------------------------------
  * HSPREC01 header, then records exactly as the BPF program emitted them.
- * All little-endian. */
+ * All little-endian.
+ *
+ * Between the fixed header and the first record (inside hdr_size, so a
+ * reader that only knows the fixed header skips it) the recorder keeps the
+ * target's executable mappings: n_maps entries of struct hs_file_map, each
+ * followed by its path padded to 8 bytes.  `hsp fold' names a pc outside
+ * the executable from them.  A capture without them has n_maps 0. */
 #define HS_FILE_MAGIC                 "HSPREC01"
 
 struct hs_file_hdr {
@@ -103,7 +133,18 @@ struct hs_file_hdr {
     hs_u32 freq_hz;
     hs_u64 text_lo, text_hi;     /* the target's executable range, as sampled */
     hs_u64 t0_ns;                /* CLOCK_MONOTONIC when sampling started */
-    hs_u64 reserved[2];
+    hs_u32 n_maps;               /* mappings after this header; 0 in older captures */
+    hs_u32 maps_bytes;           /* bytes they take, of the HS_FILE_MAPS_ROOM reserved */
+    hs_u64 reserved;
+};
+
+#define HS_FILE_MAPS_ROOM             (64u << 10)
+
+struct hs_file_map {
+    hs_u64 start, end;           /* the mapping, as in /proc/PID/maps (r-xp only) */
+    hs_u64 offset;               /* file offset of `start' */
+    hs_u32 path_len;             /* bytes of path that follow, then padding to 8 */
+    hs_u32 pad;
 };
 
 /* One sample: fixed part, then `depth' pairs of (info pointer, updatee
@@ -139,7 +180,41 @@ struct hs_cfg {
     hs_u32 off_curtso, off_nursery;
     hs_u32 off_stackobj, off_id, off_label, off_alloc_limit;
     hs_u32 want_label, want_alloc;
-    hs_u32 want_thunk, pad_;       /* name update frames' thunks by their creator */
+    hs_u32 want_thunk;           /* name update frames' thunks by their creator */
+    hs_u32 want_outside;         /* record ticks whose pc is outside text_lo..text_hi */
+};
+
+/* The Task route: who is running when r13 is not BaseReg (C code).
+ *
+ * The threaded RTS keeps one Task per OS thread in thread-local storage
+ * (`my_task', rts/Task.c).  From it, without any register:
+ *
+ *   task->cap, and cap->running_task == task   this OS thread holds a capability
+ *     cap->in_haskell, cap->r.rCurrentTSO       ... and is inside StgRun: the
+ *                                               thread is in Haskell code or an
+ *                                               unsafe foreign call from it
+ *   task->incall->suspended_tso                 the thread this OS thread is
+ *                                               making a safe foreign call for
+ *                                               (it gave the capability up)
+ *
+ * The scheduler clears rCurrentTSO and in_haskell when a thread stops
+ * running and resumeThread clears suspended_tso, so none of these is ever a
+ * thread that ran earlier.  Holding a capability with neither is the RTS
+ * itself; r13 being the gc_thread of a capability it holds then says it is
+ * the collector (the GC keeps its `gct' in r13, rts/sm/GCTDecl.h).
+ *
+ * In .bss, not rodata: for a spawned program the RTS does not exist yet when
+ * the BPF program is loaded.  The loader fills this in and sets `enabled'
+ * last, once it has followed the same chain through the live process and
+ * found it consistent (sampler.c, task_check).  Until then, and for good if
+ * the check fails, the BPF program behaves as it did without this. */
+struct hs_task_cfg {
+    hs_u32 enabled;
+    hs_u32 off_task_cap, off_task_incall;
+    hs_u32 off_incall_susp_tso;
+    hs_u32 off_cap_r, off_cap_no, off_cap_running_task, off_cap_in_haskell;
+    hs_s64 tls_my_task;          /* my_task's address minus the thread's fs base */
+    hs_u64 gc_threads;           /* &gc_threads, or 0: no GC flag */
 };
 
 /* Counters the BPF program keeps, printed by the loader at exit. */
@@ -153,5 +228,10 @@ enum hs_stat {
     HS_ST_BROKEN,
     HS_ST_TRUNCATED,
     HS_ST_DROPPED,        /* ring buffer full: record lost               */
+    HS_ST_VIA_TASK,       /* thread found through the Task, not r13      */
+    HS_ST_SAFE,           /* ... of which in a safe foreign call         */
+    HS_ST_GC,             /* no thread: collecting garbage               */
+    HS_ST_STALE_R13,      /* r13 named a TSO the Task route disowned     */
+    HS_ST_NO_TASK_ROUTE,  /* r13 not a mutator's and the Task route off  */
     HS_ST_COUNT
 };

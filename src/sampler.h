@@ -18,6 +18,8 @@ struct hs_sampler_opts {
     unsigned ring_mb;        /* 0 = 8 */
     int no_label, no_alloc, no_thunk;
     const char *event;       /* "cpu-clock" (NULL = this), "cycles", "ibs" */
+    int outside_text;        /* also record ticks whose pc is outside the executable */
+    int no_task;             /* do not identify threads in C code through the RTS's Task */
 };
 
 struct hs_sampler_info {
@@ -29,6 +31,9 @@ struct hs_sampler_info {
     int cpus;                   /* perf events attached */
     unsigned freq_hz, max_depth;
     char event[16];             /* the sampling event in use */
+    /* threads in C code, found through the RTS's Task: 1 in use, 0 not
+     * decided yet (the RTS has not started), -1 off (reason on stderr) */
+    int task_route;
 };
 
 struct hs_sampler;

@@ -30,6 +30,66 @@ static int die(const char *what)
 
 struct sink { FILE *fp; uint64_t records, bytes; int failed; };
 
+/* The target's executable mappings, as the capture header carries them
+ * (hsp_abi.h): what `hsp fold' needs to name a pc in a shared library.
+ * Snapshots are merged, so a library loaded during the capture is there
+ * too.  Entries are packed into `buf' (HS_FILE_MAPS_ROOM bytes). */
+struct maps { unsigned char *buf; uint32_t n, bytes, dropped; };
+
+static int maps_has(const struct maps *m, const struct hs_file_map *e, const char *path)
+{
+    for (uint32_t off = 0, i = 0; i < m->n; i++) {
+        const struct hs_file_map *x = (const struct hs_file_map *)(m->buf + off);
+        if (x->start == e->start && x->end == e->end && x->offset == e->offset && x->path_len == e->path_len &&
+            !memcmp(x + 1, path, e->path_len)) return 1;
+        off += sizeof *x + ((x->path_len + 7) & ~7u);
+    }
+    return 0;
+}
+
+static int maps_snapshot(struct maps *m, pid_t pid, const char *exe)
+{
+    char path[64], line[PATH_MAX + 128], now[PATH_MAX];
+    /* a spawned child is hsp's own image until it execs */
+    snprintf(path, sizeof path, "/proc/%d/exe", pid);
+    ssize_t len = readlink(path, now, sizeof now - 1);
+    if (len < 0) return 0;
+    now[len] = 0;
+    if (strcmp(now, exe)) return 0;
+    snprintf(path, sizeof path, "/proc/%d/maps", pid);
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+    while (fgets(line, sizeof line, fp)) {
+        unsigned long lo, hi, off;
+        char perms[8];
+        int at = 0;
+        if (sscanf(line, "%lx-%lx %7s %lx %*s %*s %n", &lo, &hi, perms, &off, &at) < 4 || perms[2] != 'x') continue;
+        char *name = line + at;
+        name[strcspn(name, "\n")] = 0;
+        struct hs_file_map e = { .start = lo, .end = hi, .offset = off, .path_len = strlen(name) };
+        uint32_t need = sizeof e + ((e.path_len + 7) & ~7u);
+        if (maps_has(m, &e, name)) continue;
+        if (m->bytes + need > HS_FILE_MAPS_ROOM) { m->dropped++; continue; }
+        memset(m->buf + m->bytes, 0, need);
+        memcpy(m->buf + m->bytes, &e, sizeof e);
+        memcpy(m->buf + m->bytes + sizeof e, name, e.path_len);
+        m->bytes += need; m->n++;
+    }
+    fclose(fp);
+    return 1;
+}
+
+/* The header and the mappings after it; the room is fixed, so they can be
+ * rewritten in place when the capture ends. */
+static int write_header(FILE *fp, struct hs_file_hdr *fh, const struct maps *m)
+{
+    fh->n_maps = m->n; fh->maps_bytes = m->bytes;
+    if (fseek(fp, 0, SEEK_SET)) return -1;
+    if (fwrite(fh, sizeof *fh, 1, fp) != 1) return -1;
+    if (fwrite(m->buf, 1, HS_FILE_MAPS_ROOM, fp) != HS_FILE_MAPS_ROOM) return -1;
+    return 0;
+}
+
 static int on_record(void *ctx, const struct hs_rec *r, size_t len)
 {
     struct sink *s = ctx;
@@ -42,7 +102,7 @@ static int on_record(void *ctx, const struct hs_rec *r, size_t len)
 static void usage(void)
 {
     fputs("usage: hsp record [-F hz] [-e event] [-d depth] [-t secs] [-r ring_mb] [--no-label] [--no-alloc] [--no-thunk]\n"
-          "                  -o FILE (-p PID | -- program args...)\n"
+          "                  [--no-task] [--text-only] -o FILE (-p PID | -- program args...)\n"
           "  -F hz        sample frequency per CPU (default 99)\n"
           "  -e event     what drives sampling: cpu-clock (default, works anywhere), cycles (needs a PMU),\n"
           "               ibs (AMD Instruction-Based Sampling: exact leaf addresses; needs the ibs_op PMU)\n"
@@ -52,6 +112,8 @@ static void usage(void)
           "  --no-label   do not read the green thread's label (rid:...)\n"
           "  --no-alloc   do not read the allocation counter\n"
           "  --no-thunk   do not name update frames' thunks by their creator (2 reads per update frame)\n"
+          "  --no-task    do not identify the thread behind C code through the RTS's Task (r13 only)\n"
+          "  --text-only  drop ticks whose pc is outside the executable (shared libraries, vdso)\n"
           "  -o FILE      the capture (HSPREC01); `hsp fold' reads it\n", stderr);
 }
 
@@ -83,7 +145,7 @@ static int is_pie(const char *exe)
 
 int cmd_record(int argc, char **argv)
 {
-    struct hs_sampler_opts o = { .freq_hz = 99, .max_depth = 512, .ring_mb = 8 };
+    struct hs_sampler_opts o = { .freq_hz = 99, .max_depth = 512, .ring_mb = 8, .outside_text = 1 };
     double duration = 0;
     const char *out = NULL;
     pid_t pid = 0;
@@ -101,6 +163,8 @@ int cmd_record(int argc, char **argv)
         else if (!strcmp(a, "--no-label")) o.no_label = 1;
         else if (!strcmp(a, "--no-alloc")) o.no_alloc = 1;
         else if (!strcmp(a, "--no-thunk")) o.no_thunk = 1;
+        else if (!strcmp(a, "--no-task")) o.no_task = 1;
+        else if (!strcmp(a, "--text-only")) o.outside_text = 0;
         else { usage(); return 2; }
     }
     int spawn = cmd && *cmd;
@@ -140,13 +204,15 @@ int cmd_record(int argc, char **argv)
     const struct hs_sampler_info *in = hs_sampler_info(s);
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    struct maps maps = { .buf = calloc(1, HS_FILE_MAPS_ROOM) };
+    int have_maps = maps_snapshot(&maps, pid, in->exe);
     struct hs_file_hdr fh = {
-        .version = 1, .hdr_size = sizeof fh, .pid = pid, .freq_hz = in->freq_hz,
+        .version = 1, .hdr_size = sizeof fh + HS_FILE_MAPS_ROOM, .pid = pid, .freq_hz = in->freq_hz,
         .text_lo = in->text_lo, .text_hi = in->text_hi,
         .t0_ns = (uint64_t)t0.tv_sec * 1000000000ull + t0.tv_nsec,
     };
     memcpy(fh.magic, HS_FILE_MAGIC, 8);
-    if (fwrite(&fh, sizeof fh, 1, sink.fp) != 1) return die(out);
+    if (write_header(sink.fp, &fh, &maps)) return die(out);
     if (gate[1] >= 0) { if (write(gate[1], "g", 1) != 1) return die("write gate"); close(gate[1]); }
 
     signal(SIGINT, on_signal);
@@ -156,8 +222,17 @@ int cmd_record(int argc, char **argv)
             (unsigned long)in->text_lo, (unsigned long)in->text_hi, out);
 
     int child_status = 0;
+    struct timespec maps_at = t0;
     for (;;) {
         if (hs_sampler_poll(s, 100) < 0) break;
+        /* the mappings again every second: the target may exit before the
+         * capture ends, and libraries come and go */
+        struct timespec tn;
+        clock_gettime(CLOCK_MONOTONIC, &tn);
+        if (!have_maps || tn.tv_sec > maps_at.tv_sec) {
+            if (maps_snapshot(&maps, pid, in->exe)) have_maps = 1;
+            maps_at = tn;
+        }
         if (stop_requested || sink.failed) break;
         if (spawn) {
             if (waitpid(pid, &child_status, WNOHANG) == pid) break;
@@ -171,6 +246,9 @@ int cmd_record(int argc, char **argv)
         }
     }
     hs_sampler_poll(s, 0);
+    maps_snapshot(&maps, pid, in->exe);
+    if (!sink.failed && write_header(sink.fp, &fh, &maps)) sink.failed = errno;
+    if (maps.dropped) fprintf(stderr, "hsp record: %u executable mappings did not fit in the capture header\n", maps.dropped);
     if (fclose(sink.fp) != 0 && !sink.failed) sink.failed = errno;
     if (spawn && !WIFEXITED(child_status) && !WIFSIGNALED(child_status)) {
         kill(pid, SIGTERM);
@@ -180,11 +258,15 @@ int cmd_record(int argc, char **argv)
     hs_sampler_stats(s, st);
     fprintf(stderr,
             "hsp record: records=%lu bytes=%lu | ticks=%lu outside_text=%lu kernel=%lu tso=%lu "
-            "walked=%lu stop=%lu broken=%lu truncated=%lu dropped=%lu\n",
+            "walked=%lu stop=%lu broken=%lu truncated=%lu dropped=%lu | via_task=%lu (safe=%lu) gc=%lu "
+            "stale_r13=%lu no_task_route=%lu task_route=%s\n",
             (unsigned long)sink.records, (unsigned long)sink.bytes,
             (unsigned long)st[HS_ST_TICKS], (unsigned long)st[HS_ST_OUTSIDE_TEXT], (unsigned long)st[HS_ST_KERNEL],
             (unsigned long)st[HS_ST_TSO], (unsigned long)st[HS_ST_WALKED], (unsigned long)st[HS_ST_STOP],
-            (unsigned long)st[HS_ST_BROKEN], (unsigned long)st[HS_ST_TRUNCATED], (unsigned long)st[HS_ST_DROPPED]);
+            (unsigned long)st[HS_ST_BROKEN], (unsigned long)st[HS_ST_TRUNCATED], (unsigned long)st[HS_ST_DROPPED],
+            (unsigned long)st[HS_ST_VIA_TASK], (unsigned long)st[HS_ST_SAFE], (unsigned long)st[HS_ST_GC],
+            (unsigned long)st[HS_ST_STALE_R13], (unsigned long)st[HS_ST_NO_TASK_ROUTE],
+            in->task_route > 0 ? "on" : in->task_route < 0 ? "off" : "undecided");
     hs_sampler_close(s);
     if (sink.failed) { errno = sink.failed; return die(out); }
     return spawn && WIFEXITED(child_status) ? WEXITSTATUS(child_status) : 0;

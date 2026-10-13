@@ -12,11 +12,30 @@
  *     r12  Hp                        -> allocation counter
  *
  * Whether these registers ARE a mutator's: r13 + off_curtso must point at
- * an object whose header word is stg_TSO_info.  C code (GC, libc, foreign
- * calls) reuses r13 freely and then the read fails or finds something else:
- * such ticks are recorded with NOFRAME and depth 0, and their pc still says
- * what was running.  A stale-but-valid r13 in a GC thread passes this and
- * fails the next one: rbp must lie inside that TSO's current stack chunk.
+ * an object whose header word is stg_TSO_info, and rbp must lie inside that
+ * TSO's current stack chunk.  Then the thread is known and its stack is
+ * walked: the common case, three reads.
+ *
+ * C code (a foreign call, the RTS, the GC) reuses r13 and rbp, and a pc
+ * outside the executable is C by definition.  There the thread comes from
+ * the OS thread's Task instead (hs_task_cfg in hsp_abi.h): the thread
+ * running on the capability this OS thread holds, or the thread whose safe
+ * foreign call it is making.  Such records carry HS_F_TASK.  Their stack:
+ * for a safe call the TSO's saved Sp (the code generator stores it before
+ * suspendThread); for an unsafe call Sp is still in rbp if the C code has
+ * not touched that callee-saved register, and is not recoverable otherwise
+ * (no stack then; fold shows the leaf under the thread's label).  Hp (r12)
+ * is not trusted in C, so these records never carry an allocation counter.
+ *
+ * A TSO that r13 names while rbp is not in its stack is not taken at its
+ * word either: during a safe call r13 may still point at the capability
+ * the OS thread gave up, which another OS thread is by then running a
+ * different green thread on.  The Task route decides; only where it is
+ * unavailable (not validated, non-threaded RTS) is that TSO kept, as before.
+ *
+ * An OS thread that holds a capability but runs no Haskell thread is the
+ * scheduler or the collector; with r13 naming a gc_thread of its own it is
+ * flagged HS_F_GC.  Garbage collection is not billed to a thread.
  *
  * When the tick lands in kernel mode (a syscall), ctx->regs is kernel state
  * and the user registers are the ones saved at kernel entry
@@ -63,6 +82,9 @@ struct {
     __type(value, __u32);
 } walk_n SEC(".maps");
 
+/* Filled in and enabled by the loader once validated (hs_task_cfg). */
+volatile struct hs_task_cfg tcfg SEC(".bss");
+
 static __always_inline void bump(enum hs_stat s)
 {
     __sync_fetch_and_add(&stats[s], 1);
@@ -75,12 +97,72 @@ static long walk_cb(__u64 i, void *p)
     return hswalk_step((struct hswalk *)p) ? 1 : 0;
 }
 
+enum { HS_VIA_OFF = 0,     /* not an RTS OS thread, or the route is off */
+       HS_VIA_CAP,         /* thread running on the capability held here */
+       HS_VIA_SAFE,        /* thread whose safe foreign call this is     */
+       HS_VIA_GC,          /* a capability held, collecting garbage      */
+       HS_VIA_RTS,         /* capability held, no thread: the scheduler  */
+       HS_VIA_IDLE };      /* an RTS OS thread with nothing to bill      */
+
+static __always_inline int hs_is_tso(__u64 tso)
+{
+    __u64 hdr = 0;
+    return tso && !(tso & 7) && hs_read_u64(&hdr, tso) == 0 && hdr == cfg.stg_tso_info;
+}
+
+/* Who this OS thread is working for, from its Task (see hs_task_cfg).
+ * Everything read is this thread's own state or state only the holder of
+ * the capability writes, and the thread is stopped at the tick. */
+static __always_inline int hs_via_task(__u64 r13, __u64 *tso_out)
+{
+    struct task_struct *cur = bpf_get_current_task_btf();
+    __u64 fs = BPF_CORE_READ(cur, thread.fsbase);
+    __u64 task = 0, cap = 0, run = 0, tso = 0, incall = 0;
+    __u8 in_haskell = 0;
+    int owns;
+
+    if (!fs || hs_read_u64(&task, fs + tcfg.tls_my_task) || !task)
+        return HS_VIA_OFF;
+    owns = hs_read_u64(&cap, task + tcfg.off_task_cap) == 0 && cap &&
+           hs_read_u64(&run, cap + tcfg.off_cap_running_task) == 0 && run == task;
+    if (owns &&
+        bpf_probe_read_user(&in_haskell, 1, (const void *)(unsigned long)(cap + tcfg.off_cap_in_haskell)) == 0 &&
+        in_haskell == 1 &&
+        hs_read_u64(&tso, cap + tcfg.off_cap_r + cfg.off_curtso) == 0 && hs_is_tso(tso)) {
+        *tso_out = tso;
+        return HS_VIA_CAP;
+    }
+    if (hs_read_u64(&incall, task + tcfg.off_task_incall) == 0 && incall &&
+        hs_read_u64(&tso, incall + tcfg.off_incall_susp_tso) == 0 && hs_is_tso(tso)) {
+        *tso_out = tso;
+        return HS_VIA_SAFE;
+    }
+    /* The collector keeps its gc_thread in r13 (`gct', rts/sm/GCTDecl.h): r13
+     * is gc_threads[n] for a capability n this OS thread holds.  Not
+     * task->cap's n: the thread that runs a collection holds every idle
+     * capability too, and task->cap may be any of them. */
+    if (tcfg.gc_threads && r13 && !(r13 & 7)) {
+        __u64 arr = 0, gct = 0, gcap = 0, grun = 0;
+        __u32 no = 0;
+        if (hs_read_u64(&gcap, r13 + HS_OFF_GCTHREAD_CAP) == 0 && gcap && !(gcap & 7) &&
+            hs_read_u32(&no, gcap + tcfg.off_cap_no) == 0 && no < 4096 &&
+            hs_read_u64(&arr, tcfg.gc_threads) == 0 && arr &&
+            hs_read_u64(&gct, arr + (__u64)no * 8) == 0 && gct == r13 &&
+            hs_read_u64(&grun, gcap + tcfg.off_cap_running_task) == 0 && grun == task)
+            return HS_VIA_GC;
+    }
+    if (!owns)
+        return HS_VIA_IDLE;
+    return HS_VIA_RTS;
+}
+
 SEC("perf_event")
 int hsp_sample(struct bpf_perf_event_data *ctx)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u64 ip, sp, base, hp, cs, tso = 0, hdr = 0, t0;
-    __u32 zero = 0, depth = 0;
+    __u64 ip, sp, base, hp, cs, tso = 0, stackobj = 0, t0;
+    __u32 zero = 0, depth = 0, *np;
+    int have_stack = 0, mutator, outside;
     __u8 flags = 0, status = HS_STATUS_NOFRAME;
     struct hs_rec *r;
     struct pt_regs *regs = (struct pt_regs *)&ctx->regs;
@@ -108,26 +190,78 @@ int hsp_sample(struct bpf_perf_event_data *ctx)
         base = *(volatile __u64 *)&regs->r13;
         hp   = *(volatile __u64 *)&regs->r12;
     }
-    /* bpftrace's sampler skipped these too; a leaf in libc/vdso has no
-     * Haskell name and its stack would be walked from a C rbp */
-    if (ip < cfg.text_lo || ip >= cfg.text_hi) {
+    /* a pc outside the executable (a shared library, the vdso) is C code:
+     * its name comes from the library offline.  The agent does not carry
+     * the mappings and leaves these out. */
+    outside = ip < cfg.text_lo || ip >= cfg.text_hi;
+    if (outside) {
         bump(HS_ST_OUTSIDE_TEXT);
-        return 0;
+        if (!cfg.want_outside)
+            return 0;
     }
 
     r = bpf_map_lookup_elem(&scratch, &zero);
-    if (!r)
+    np = bpf_map_lookup_elem(&walk_n, &zero);
+    if (!r || !np)
         return 0;
     t0 = bpf_ktime_get_ns();
     r->tso_id = 0;
     r->alloc = 0;
     r->label_len = 0;
 
-    /* r13 -> rCurrentTSO -> header == stg_TSO_info: a live Haskell thread */
+    struct hswalk w = {
+        .text_lo = cfg.text_lo, .text_hi = cfg.text_hi,
+        .max_depth = cfg.max_depth ? cfg.max_depth : HS_MAX_DEPTH,
+        .frames = r->frames,
+        .want_thunk = cfg.want_thunk,
+        .np = np,
+    };
+
+    /* r13 -> rCurrentTSO -> header == stg_TSO_info, and rbp inside its
+     * stack: a Haskell thread, in Haskell code */
     if (base && !(base & 7) &&
-        hs_read_u64(&tso, base + cfg.off_curtso) == 0 && tso &&
-        hs_read_u64(&hdr, tso) == 0 && hdr == cfg.stg_tso_info) {
-        __u64 stackobj = 0, lbl = 0, nursery = 0, start = 0;
+        hs_read_u64(&tso, base + cfg.off_curtso) == 0 && hs_is_tso(tso)) {
+        hs_read_u64(&stackobj, tso + cfg.off_stackobj);
+        have_stack = hswalk_enter(&w, stackobj, sp) == 0;
+    } else {
+        tso = 0;
+    }
+    mutator = have_stack;
+
+    if (!mutator) {
+        __u64 t2 = 0;
+        int via = tcfg.enabled ? hs_via_task(base, &t2) : HS_VIA_OFF;
+        if (via == HS_VIA_CAP || via == HS_VIA_SAFE) {
+            tso = t2;
+            flags |= HS_F_TASK;
+            bump(HS_ST_VIA_TASK);
+            stackobj = 0;
+            hs_read_u64(&stackobj, tso + cfg.off_stackobj);
+            if (via == HS_VIA_SAFE) {
+                /* saved by the caller before suspendThread */
+                flags |= HS_F_SAFE;
+                bump(HS_ST_SAFE);
+                sp = 0;
+                if (stackobj)
+                    hs_read_u64(&sp, stackobj + HS_OFF_STACK_SP);
+            }
+            have_stack = hswalk_enter(&w, stackobj, sp) == 0;
+        } else if (via != HS_VIA_OFF) {
+            /* the Task says no thread is running here */
+            if (tso)
+                bump(HS_ST_STALE_R13);
+            tso = 0;
+            if (via == HS_VIA_GC) {
+                flags |= HS_F_GC;
+                bump(HS_ST_GC);
+            }
+        } else if (!tcfg.enabled) {
+            bump(HS_ST_NO_TASK_ROUTE);
+        }
+    }
+
+    if (tso) {
+        __u64 lbl = 0, nursery = 0, start = 0;
         __u64 limit = 0;
         flags |= HS_F_TSO;
         bump(HS_ST_TSO);
@@ -148,8 +282,10 @@ int hsp_sample(struct bpf_perf_event_data *ctx)
 
         /* getAllocationCounter (PrimOps.cmm): alloc_limit counts down per
          * finished nursery block, minus the used part of the current one,
-         * Hp - CurrentNursery->start.  Only meaningful with Hp inside it. */
-        if (cfg.want_alloc &&
+         * Hp - CurrentNursery->start.  Only meaningful with Hp inside it,
+         * and only where r12 is Hp: never for a thread found via its Task,
+         * nor for a pc outside the executable (C, whatever it left in r12). */
+        if (cfg.want_alloc && !(flags & HS_F_TASK) && !outside &&
             hs_read_u64(&limit, tso + cfg.off_alloc_limit) == 0 &&
             hs_read_u64(&nursery, base + cfg.off_nursery) == 0 && nursery &&
             hs_read_u64(&start, nursery + HS_OFF_BDESCR_START) == 0 &&
@@ -158,19 +294,9 @@ int hsp_sample(struct bpf_perf_event_data *ctx)
             flags |= HS_F_ALLOC;
         }
 
-        __u32 *np = bpf_map_lookup_elem(&walk_n, &zero);
-        if (!np)
-            return 0;
-        struct hswalk w = {
-            .text_lo = cfg.text_lo, .text_hi = cfg.text_hi,
-            .max_depth = cfg.max_depth ? cfg.max_depth : HS_MAX_DEPTH,
-            .frames = r->frames,
-            .want_thunk = cfg.want_thunk,
-            .np = np,
-        };
-        hs_read_u64(&stackobj, tso + cfg.off_stackobj);
-        if (hswalk_begin(&w, stackobj, sp) == 0) {
+        if (have_stack) {
             bump(HS_ST_WALKED);
+            hswalk_scan(&w);
             if (!w.done)
                 bpf_loop(HS_MAX_DEPTH + HS_MAX_CHUNK_HOPS, walk_cb, &w, 0);
             depth = *np;
